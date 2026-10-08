@@ -1,11 +1,11 @@
 # agy-unlock-analog installer (Windows PowerShell)
 # One-line install:
-#   irm https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.ps1 | iex
+#   irm https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.ps1 | iex
 # Local:  .\install.ps1
 # Override:  $env:AGY_ANALOG_BASE_URL='https://host/dir'; irm ... | iex
 $ErrorActionPreference = 'Stop'
 
-$DefaultBase = 'https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main'
+$DefaultBase = 'https://raw.githubusercontent.com/trustybird/agy-unlock/main'
 $Base = if ($env:AGY_ANALOG_BASE_URL) { $env:AGY_ANALOG_BASE_URL } else { $DefaultBase }
 $InvPath = $MyInvocation.MyCommand.Path
 $ScriptDir = if ($InvPath) { Split-Path -Parent $InvPath } else { '' }

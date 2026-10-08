@@ -1588,29 +1588,186 @@ def daemon_status():
         print(f"[*] демон: {'установлен' if unit.exists() else 'не установлен'} ({unit})")
 
 
-def interactive():
-    print(f"=== {TOOL_NAME} {VERSION} ===")
-    cmd_status(None)
-    while True:
-        print("\n[1] unlock all  (пропатчить)\n[2] restore all (откатить)\n"
-              "[3] daemon install\n[4] daemon status\n[q] выход")
+def _menu_state():
+    """Снимок целей для меню: {name: (path|None, status)}."""
+    t = find_all_targets()
+    out = {}
+    for name in ("manager", "cli", "ide"):
+        p = t.get(name)
+        if p is None:
+            out[name] = (None, "not found")
+            continue
+        if name == "manager":
+            st = scan_manager(p)[0]
+        elif name == "cli":
+            st = scan_cli(p)[0]
+        else:
+            st = scan_ide(p)[0]
+        out[name] = (p, st)
+    return out
+
+
+def _print_menu_panel(state):
+    print(f"--- {TOOL_NAME} {VERSION} ---")
+    rows = (("manager", "ANTIGRAVITY 2.0"), ("cli", "ANTIGRAVITY CLI"), ("ide", "ANTIGRAVITY IDE"))
+    for name, title in rows:
+        p, st = state[name]
+        print(f"[{title}]")
+        print(f"  Target: {p if p else 'Not found'}")
+        if p is None:
+            print("  Status: not found")
+            continue
         try:
-            ch = input("> ").strip().lower()
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        bp = backup_path_for(p)
+        print(f"  Status: found  Patch: {st}")
+        print(f"  Size: {human_size(size)}  Backup: {'yes' if bp.exists() else 'no'}")
+    print()
+
+
+def _pause():
+    try:
+        input("  Press Enter to return to menu...")
+    except (EOFError, KeyboardInterrupt):
+        print()
+
+
+def _menu_custom_path(state):
+    print("--- CUSTOM PATH ---")
+    print("1  Manager path   (folder or language_server binary)")
+    print("2  CLI path       (agy.exe or folder)")
+    print("3  IDE path       (folder or main.js)")
+    print("0  Back")
+    try:
+        ch = input("\n  Select option > ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if ch not in ("1", "2", "3"):
+        return
+    kind = {"1": "manager", "2": "cli", "3": "ide"}[ch]
+    try:
+        raw = input(f"  {kind} Path > ").strip().strip('"').strip("'")
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return
+    if not raw:
+        return
+    p = Path(os.path.abspath(os.path.expanduser(raw)))
+    found = None
+    if p.is_file():
+        found = p
+    elif p.is_dir():
+        want = {"manager": ("language_server.exe", "language_server"),
+                "cli": ("agy.exe", "agy"), "ide": ("main.js",)}[kind]
+        for root, _, files in os.walk(p):
+            for fn in want:
+                if fn in files:
+                    found = Path(root) / fn
+                    break
+            if found or len(root.split(os.sep)) > 8:
+                break
+            if found:
+                break
+    if found and found.is_file():
+        state[kind] = (found, "custom")
+        print(f"  Path updated: {found}")
+    else:
+        print("  [!] target not found at this path")
+
+
+def _menu_about():
+    print(f"--- ABOUT {TOOL_NAME} {VERSION} ---")
+    print("  Removes the Antigravity region block locally:")
+    print("  Manager (language_server binary), CLI (agy binary), IDE (main.js).")
+    print("  Backups are kept as *.agybak, everything is reversible.")
+    print("  Note: a DNS with geo-spoofing is still required,")
+    print("  the client patch alone is not enough.")
+    print("  Repo: https://github.com/trustybird/agy-unlock")
+
+
+def interactive(custom=None):
+    state = _menu_state()
+    if custom:
+        for k, v in custom.items():
+            if v is not None:
+                state[k] = (v, "custom")
+    while True:
+        _print_menu_panel(state)
+        print("--- PATCH ---")
+        print("1  Manager patch   (language_server binary)")
+        print("2  CLI patch       (agy binary)")
+        print("3  IDE patch       (main.js)")
+        print("4  Patch all       (everything found)")
+        print("--- RESTORE ---")
+        print("5  Manager restore (from backup)")
+        print("6  CLI restore     (from backup)")
+        print("7  IDE restore     (from backup)")
+        print("--- TOOLS ---")
+        print("8  Daemon install  (re-patch automatically after updates)")
+        print("9  Daemon status")
+        print("10 Learn           (re-discover gates in new builds)")
+        print("11 Custom path     (override auto-detection)")
+        print("12 About")
+        print()
+        print("0  Exit")
+        try:
+            ch = input("\n  Select option > ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             break
-        if ch in ("q", "quit", "exit"):
+        print()
+        if ch == "0" or ch.lower() in ("q", "quit", "exit"):
             break
-        if ch == "1":
-            cmd_unlock("all", False, None)
-        elif ch == "2":
-            cmd_restore("all", None)
-        elif ch == "3":
+        if ch == "":
+            continue
+        if ch not in {str(i) for i in range(1, 13)}:
+            print("[!] Invalid choice")
+            _pause()
+            continue
+        if ch in ("1", "2", "3", "4"):
+            if ch == "4":
+                cmd_unlock("all", False, None)
+            else:
+                name = {"1": "manager", "2": "cli", "3": "ide"}[ch]
+                p, _ = state.get(name, (None, None))
+                if p is None:
+                    print(f"[!] {name} not found - use 11 Custom path first")
+                elif name == "manager":
+                    print(f"[*] {p}\n    -> {do_unlock(p, False)}")
+                elif name == "cli":
+                    print(f"[*] {p}\n    -> {do_patch_cli(p)}")
+                else:
+                    print(f"[*] {p}\n    -> {do_patch_ide(p)}")
+            state = _menu_state()
+            _pause()
+        elif ch in ("5", "6", "7"):
+            name = {"5": "manager", "6": "cli", "7": "ide"}[ch]
+            p, _ = state.get(name, (None, None))
+            if p is None:
+                print(f"[!] {name} not found - use 11 Custom path first")
+            else:
+                print(f"[*] {p}\n    -> {do_restore(p)}")
+            state = _menu_state()
+            _pause()
+        elif ch == "8":
             daemon_install()
-        elif ch == "4":
+            _pause()
+        elif ch == "9":
             daemon_status()
-        else:
-            print("неизвестный пункт")
+            _pause()
+        elif ch == "10":
+            cmd_learn("all", None, apply=False, auto=False)
+            state = _menu_state()
+            _pause()
+        elif ch == "11":
+            _menu_custom_path(state)
+            _pause()
+        elif ch == "12":
+            _menu_about()
+            _pause()
 
 
 def main(argv=None):

@@ -1,11 +1,11 @@
 @echo off
 REM agy-unlock-analog installer (Windows CMD)
 REM One-line install:
-REM   curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.cmd -o install.cmd && install.cmd && del install.cmd
+REM   curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 REM Local:  install.cmd
 setlocal EnableDelayedExpansion
 
-set "DEFAULT_BASE=https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main"
+set "DEFAULT_BASE=https://raw.githubusercontent.com/trustybird/agy-unlock/main"
 if "%AGY_ANALOG_BASE_URL%"=="" (set "BASE=%DEFAULT_BASE%") else (set "BASE=%AGY_ANALOG_BASE_URL%")
 set "SCRIPTDIR=%~dp0"
 set "LOCALPATCHER=%SCRIPTDIR%patcher.py"

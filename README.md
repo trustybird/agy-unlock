@@ -28,19 +28,19 @@
 Windows PowerShell:
 
 ```powershell
-irm https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.ps1 | iex
 ```
 
 Windows CMD:
 
 ```cmd
-curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.cmd -o install.cmd && install.cmd && del install.cmd
+curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 ```
 
 Linux / macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.sh | bash
 ```
 
 Скрипт сам найдёт приложения, сделает бэкапы и пропатчит. Больше ничего
