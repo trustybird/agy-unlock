@@ -1588,6 +1588,76 @@ def daemon_status():
         print(f"[*] демон: {'установлен' if unit.exists() else 'не установлен'} ({unit})")
 
 
+# --------------------------------------------------- tui ---
+
+_C = {"cyan": 36, "green": 32, "yellow": 33, "red": 31, "dim": 90, "bold": 1, "white": 37}
+
+
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _c(text: str, *names: str) -> str:
+    if not _use_color() or not names:
+        return text
+    codes = ";".join(str(_C[n]) for n in names if n in _C)
+    return f"\x1b[{codes}m{text}\x1b[0m"
+
+
+def _kv(label: str, value: str, color: str = ""):
+    print(f"      {label:<9}{_c(value, color) if color else value}")
+
+
+def _banner():
+    print(_c("Region bypass for Antigravity", "green", "bold"))
+    print(_c("Clean - No keys - No telemetry", "green"))
+    print("+------------------------------+-------------------------------------+")
+    print("| " + _c("Repo", "yellow") + "    " +
+          _c("github.com/trustybird/agy-unlock", "white") + "          |")
+    print("+------------------------------+-------------------------------------+")
+
+
+def _clear():
+    if not _use_color():
+        print()
+        return
+    os.system("cls" if os.name == "nt" else "clear")
+
+
+def _read_asar_version(asar: Path):
+    """Версия из package.json внутри app.asar (рядом с language_server)."""
+    try:
+        import json as _json
+        with asar.open("rb") as f:
+            _u1, header_size, _u2, json_size = struct.unpack("<IIII", f.read(16))
+            header = _json.loads(f.read(json_size).decode("utf-8"))
+            pkg = header.get("files", {}).get("package.json")
+            if not pkg or "offset" not in pkg or "size" not in pkg:
+                return None
+            f.seek(8 + header_size + int(pkg["offset"]))
+            return _json.loads(f.read(int(pkg["size"])).decode("utf-8")).get("version")
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _asar_for_manager(manager_path: Path):
+    parent = manager_path.parent
+    for _ in range(4):
+        for sub in ("resources/app.asar", "app.asar"):
+            p = parent / sub
+            if p.is_file():
+                return p
+        if parent == parent.parent:
+            break
+        parent = parent.parent
+    return None
+
+
 def _menu_state():
     """Снимок целей для меню: {name: (path|None, status)}."""
     t = find_all_targets()
@@ -1608,22 +1678,44 @@ def _menu_state():
 
 
 def _print_menu_panel(state):
-    print(f"--- {TOOL_NAME} {VERSION} ---")
-    rows = (("manager", "ANTIGRAVITY 2.0"), ("cli", "ANTIGRAVITY CLI"), ("ide", "ANTIGRAVITY IDE"))
-    for name, title in rows:
-        p, st = state[name]
-        print(f"[{title}]")
-        print(f"  Target: {p if p else 'Not found'}")
-        if p is None:
-            print("  Status: not found")
-            continue
+    _banner()
+    print()
+    print("[*] Searching for installations...")
+    print("--- ANTIGRAVITY IDE " + "-" * 40)
+    p, st = state["ide"]
+    _kv("Target:", str(p) if p else "Not found", "cyan" if p else "red")
+    _kv("Status:", "found" if p else "not found", "green" if p else "red")
+    if p is not None:
+        _kv("Patch:", st, "yellow" if st == "patched" else "green")
+    print()
+    print("--- ANTIGRAVITY 2.0 " + "-" * 40)
+    p, st = state["manager"]
+    _kv("Target:", str(p) if p else "Not found", "cyan" if p else "red")
+    if p is None:
+        _kv("Status:", "not found", "red")
+    else:
+        _kv("Status:", "found", "green")
+        _kv("Patch:", st, "yellow" if "patched" in st else "green")
+        asar = _asar_for_manager(p)
+        ver = _read_asar_version(asar) if asar else None
+        _kv("Version:", ver if ver else "not detected", "green" if ver else "yellow")
         try:
             size = p.stat().st_size
         except OSError:
             size = 0
-        bp = backup_path_for(p)
-        print(f"  Status: found  Patch: {st}")
-        print(f"  Size: {human_size(size)}  Backup: {'yes' if bp.exists() else 'no'}")
+        _kv("Size:", human_size(size), "green" if size else "yellow")
+    print()
+    print("--- ANTIGRAVITY CLI " + "-" * 40)
+    p, st = state["cli"]
+    _kv("Target:", str(p) if p else "Not found", "cyan" if p else "yellow")
+    _kv("Status:", "found" if p else "not found", "green" if p else "yellow")
+    if p is not None:
+        _kv("Patch:", st, "yellow" if "patched" in st else "green")
+        try:
+            size = p.stat().st_size
+        except OSError:
+            size = 0
+        _kv("Size:", human_size(size), "green" if size else "yellow")
     print()
 
 
@@ -1696,23 +1788,24 @@ def interactive(custom=None):
                 state[k] = (v, "custom")
     while True:
         _print_menu_panel(state)
-        print("--- PATCH ---")
-        print("1  Manager patch   (language_server binary)")
-        print("2  CLI patch       (agy binary)")
-        print("3  IDE patch       (main.js)")
-        print("4  Patch all       (everything found)")
-        print("--- RESTORE ---")
-        print("5  Manager restore (from backup)")
-        print("6  CLI restore     (from backup)")
-        print("7  IDE restore     (from backup)")
-        print("--- TOOLS ---")
-        print("8  Daemon install  (re-patch automatically after updates)")
-        print("9  Daemon status")
-        print("10 Learn           (re-discover gates in new builds)")
-        print("11 Custom path     (override auto-detection)")
-        print("12 About")
+        print("--- PATCH " + "-" * 50)
+        print("[1]  Antigravity IDE patch   bypass region lock (isGoogleInternal)")
+        print("[2]  Antigravity 2.0 patch   patch language_server binary")
+        print("[3]  Antigravity CLI patch   unlock agy tool")
+        print("[4]  Patch all               everything found")
+        print("--- RESTORE " + "-" * 48)
+        print("[5]  Antigravity IDE         from backup")
+        print("[6]  Antigravity 2.0         from backup")
+        print("[7]  Antigravity CLI         from backup")
+        print("--- TOOLS " + "-" * 50)
+        print("[8]  Daemon install          re-patch automatically after updates")
+        print("[9]  Daemon status           check background task")
+        print("[10] Learn                   re-discover gates in new builds")
+        print("[11] Custom path             override auto-detected target")
+        print("[12] About                   info and links")
         print()
-        print("0  Exit")
+        print("[0]  Exit                    quit the patcher")
+        print(_c("Tip: patches are reversible - use RESTORE any time.", "dim"))
         try:
             ch = input("\n  Select option > ").strip()
         except (EOFError, KeyboardInterrupt):
@@ -1731,7 +1824,7 @@ def interactive(custom=None):
             if ch == "4":
                 cmd_unlock("all", False, None)
             else:
-                name = {"1": "manager", "2": "cli", "3": "ide"}[ch]
+                name = {"1": "ide", "2": "manager", "3": "cli"}[ch]
                 p, _ = state.get(name, (None, None))
                 if p is None:
                     print(f"[!] {name} not found - use 11 Custom path first")
@@ -1743,8 +1836,9 @@ def interactive(custom=None):
                     print(f"[*] {p}\n    -> {do_patch_ide(p)}")
             state = _menu_state()
             _pause()
+            _clear()
         elif ch in ("5", "6", "7"):
-            name = {"5": "manager", "6": "cli", "7": "ide"}[ch]
+            name = {"5": "ide", "6": "manager", "7": "cli"}[ch]
             p, _ = state.get(name, (None, None))
             if p is None:
                 print(f"[!] {name} not found - use 11 Custom path first")
@@ -1752,22 +1846,28 @@ def interactive(custom=None):
                 print(f"[*] {p}\n    -> {do_restore(p)}")
             state = _menu_state()
             _pause()
+            _clear()
         elif ch == "8":
             daemon_install()
             _pause()
+            _clear()
         elif ch == "9":
             daemon_status()
             _pause()
+            _clear()
         elif ch == "10":
             cmd_learn("all", None, apply=False, auto=False)
             state = _menu_state()
             _pause()
+            _clear()
         elif ch == "11":
             _menu_custom_path(state)
             _pause()
+            _clear()
         elif ch == "12":
             _menu_about()
             _pause()
+            _clear()
 
 
 def main(argv=None):
