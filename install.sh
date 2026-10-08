@@ -1,8 +1,8 @@
 #!/bin/sh
 # agy-unlock-analog installer (Linux/macOS)
-# Одна команда:
+# One-line install:
 #   curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.sh | bash
-# Локально:  sh install.sh
+# Local:  sh install.sh
 # Override:  AGY_ANALOG_BASE_URL=https://host/dir sh install.sh
 set -eu
 DEFAULT_BASE_URL="https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main"
@@ -51,7 +51,7 @@ else
 fi
 
 chmod +x "$dest"
-# shebang уже есть; проверяем python3
+# shebang is enough; check python3
 if ! command -v python3 >/dev/null 2>&1; then
   err "need python3 (https://www.python.org/downloads/)"
 fi

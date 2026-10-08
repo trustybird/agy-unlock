@@ -1,7 +1,7 @@
 # agy-unlock-analog installer (Windows PowerShell)
-# Одна команда:
+# One-line install:
 #   irm https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.ps1 | iex
-# Локально:  .\install.ps1
+# Local:  .\install.ps1
 # Override:  $env:AGY_ANALOG_BASE_URL='https://host/dir'; irm ... | iex
 $ErrorActionPreference = 'Stop'
 
@@ -11,7 +11,7 @@ $InvPath = $MyInvocation.MyCommand.Path
 $ScriptDir = if ($InvPath) { Split-Path -Parent $InvPath } else { '' }
 $LocalPatcher = if ($ScriptDir) { Join-Path $ScriptDir 'patcher.py' } else { '' }
 if ($LocalPatcher -and (Test-Path $LocalPatcher)) {
-  # локальный patcher.py рядом со скриптом — используем его
+  # local patcher.py next to the script - use it
 } else {
   $LocalPatcher = Join-Path (Get-Location) 'patcher.py'
 }
@@ -31,7 +31,7 @@ if (Test-Path $LocalPatcher) {
   throw "patcher.py not found nearby; set `$env:AGY_ANALOG_BASE_URL='https://host/dir' or run from repo dir"
 }
 
-# wrapper .cmd чтобы работало без указания python
+# .cmd wrapper so it works without typing python
 $cmdContent = "@echo off`r`npython `"%~dp0agy-unlock-analog.py`" %*`r`n"
 Set-Content -Path $destCmd -Value $cmdContent -Encoding Ascii
 
@@ -48,10 +48,10 @@ Write-Host "Installed: $destPy"
 Write-Host "Wrapper:   $destCmd"
 
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
-  throw 'Python 3.8+ not found in PATH — install from https://www.python.org/downloads/ (tick "Add to PATH"), then re-run.'
+  throw 'Python 3.8+ not found in PATH - install from https://www.python.org/downloads/ (tick "Add to PATH"), then re-run.'
 }
 try { & python $destPy daemon refresh 2>$null } catch {}
 try { & python $destPy status } catch {}
 Write-Host ""
-Write-Host "Для интерактива: agy-unlock-analog"
-Write-Host "Автопатч: agy-unlock-analog daemon install"
+Write-Host "Interactive mode: agy-unlock-analog"
+Write-Host "Autopatch: agy-unlock-analog daemon install"

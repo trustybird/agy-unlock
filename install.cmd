@@ -1,8 +1,8 @@
 @echo off
 REM agy-unlock-analog installer (Windows CMD)
-REM Одна команда:
+REM One-line install:
 REM   curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.cmd -o install.cmd && install.cmd && del install.cmd
-REM Локально:  install.cmd
+REM Local:  install.cmd
 setlocal EnableDelayedExpansion
 
 set "DEFAULT_BASE=https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main"
