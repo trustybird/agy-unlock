@@ -2,3 +2,6 @@ signatures.local.json
 signatures.local.prev.json
 __pycache__/
 *.pyc
+dist/
+build/
+*.spec

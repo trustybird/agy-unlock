@@ -1469,11 +1469,16 @@ def daemon_install():
     d.mkdir(parents=True, exist_ok=True)
     script = Path(__file__).resolve()
     py = sys.executable
+    frozen = bool(getattr(sys, "frozen", False))
     if sys.platform.startswith("win"):
         task = TOOL_NAME
-        pyw = _pythonw()
-        cmd_run = f'"{pyw}" "{script}" daemon run'
-        cmd_once = f'"{pyw}" "{script}" daemon refresh'
+        if frozen:
+            cmd_run = f'"{py}" daemon run'
+            cmd_once = f'"{py}" daemon refresh'
+        else:
+            pyw = _pythonw()
+            cmd_run = f'"{pyw}" "{script}" daemon run'
+            cmd_once = f'"{pyw}" "{script}" daemon refresh'
         try:
             _run_win(["schtasks", "/delete", "/tn", task, "/f"])
             r = _run_win(["schtasks", "/create", "/tn", task, "/tr", cmd_run, "/sc", "ONLOGON", "/f"])
@@ -1592,6 +1597,14 @@ def interactive():
 
 
 def main(argv=None):
+    if sys.platform.startswith("win"):
+        # schtasks отдаёт cp866/cp1251, errors="replace" даёт U+FFFD —
+        # без этого print падал бы в cp1251-консоли
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     ap = argparse.ArgumentParser(prog=TOOL_NAME, description="Analog Antigravity Unlock v2 (manager+cli+ide)")
     sub = ap.add_subparsers(dest="cmd")
     sub.add_parser("status", help="статус всех целей").add_argument("--path", default=None)
