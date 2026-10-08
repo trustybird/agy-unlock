@@ -1082,6 +1082,17 @@ def _ensure_backup(target: Path) -> str | None:
         return f"backup-error: {e}"
 
 
+def _locked_win(path: Path) -> bool:
+    """True, если файл занят другим процессом (только Windows; на POSIX замена атомарна)."""
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        with path.open("r+b"):
+            return False
+    except OSError:
+        return True
+
+
 def _apply_fixes(data: bytes, off: int, fixes) -> bytes:
     ba = bytearray(data)
     for delta, blob in fixes:
@@ -1123,6 +1134,8 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
         if if_needed:
             return "already-patched"
         return "pattern-not-found:no-unpatched-gates"
+    if _locked_win(target_path):
+        return "locked: close Antigravity first (file is busy), then retry"
     err = _ensure_backup(target_path)
     if err:
         return err
@@ -1159,6 +1172,8 @@ def do_patch_cli(target_path: Path) -> str:
             continue
         if s == "patched":
             return "already-patched"
+        if _locked_win(target_path):
+            return "locked: close Antigravity CLI first (file is busy), then retry"
         err = _ensure_backup(target_path)
         if err:
             return err
@@ -1201,6 +1216,8 @@ def do_patch_ide(target_path: Path) -> str:
         return "pattern-not-found:ide-gate-missing"
     if len(o) != 1:
         return f"pattern-not-found:ide-gate-count={len(o)}-refusing"
+    if _locked_win(target_path):
+        return "locked: close Antigravity IDE first (file is busy), then retry"
     err = _ensure_backup(target_path)
     if err:
         return err

@@ -49,9 +49,9 @@ if errorlevel 1 (
   echo Need Python 3.8+ in PATH: https://www.python.org/downloads/ ^(tick "Add to PATH"^), then re-run.
   exit /b 1
 )
-python "%DESTPY%" daemon refresh >nul 2>&1
-python "%DESTPY%" status
+python "%DESTPY%" unlock all
 echo.
-echo For interactive: agy-unlock-analog
-echo Autopatch: agy-unlock-analog daemon install
+echo Next steps:
+echo   agy-unlock-analog status           - check state
+echo   agy-unlock-analog daemon install   - re-patch automatically after updates
 endlocal

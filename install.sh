@@ -62,9 +62,8 @@ case ":$PATH:" in
   *) printf 'Add to PATH:  export PATH="%s:$PATH"\n' "$bindir" ;;
 esac
 
-"$dest" daemon refresh >/dev/null 2>&1 || true
+"$dest" unlock all || true
 
-if { true </dev/tty; } 2>/dev/null; then
-  exec "$dest" </dev/tty
-fi
-printf 'Run:  %s\n' "$BIN_NAME"
+printf '\nNext steps:\n'
+printf '  agy-unlock-analog status           # check state\n'
+printf '  agy-unlock-analog daemon install   # re-patch automatically after updates\n'

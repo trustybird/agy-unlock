@@ -50,8 +50,8 @@ Write-Host "Wrapper:   $destCmd"
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
   throw 'Python 3.8+ not found in PATH - install from https://www.python.org/downloads/ (tick "Add to PATH"), then re-run.'
 }
-try { & python $destPy daemon refresh 2>$null } catch {}
-try { & python $destPy status } catch {}
+try { & python $destPy unlock all } catch {}
 Write-Host ""
-Write-Host "Interactive mode: agy-unlock-analog"
-Write-Host "Autopatch: agy-unlock-analog daemon install"
+Write-Host "Next steps:"
+Write-Host "  agy-unlock-analog status           # check state"
+Write-Host "  agy-unlock-analog daemon install   # re-patch automatically after updates"
