@@ -1593,13 +1593,40 @@ def daemon_status():
 _C = {"cyan": 36, "green": 32, "yellow": 33, "red": 31, "dim": 90, "bold": 1, "white": 37}
 
 
+_VT_OK = None
+
+
+def _ensure_vt() -> bool:
+    """Включает Virtual Terminal Processing в conhost (иначе коды видны как текст).
+    Возвращает True, если цвета можно использовать."""
+    global _VT_OK
+    if _VT_OK is not None:
+        return _VT_OK
+    _VT_OK = True
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            h = k32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+            mode = ctypes.c_ulong()
+            if k32.GetConsoleMode(h, ctypes.byref(mode)):
+                k32.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            else:
+                _VT_OK = False
+        except Exception:
+            _VT_OK = False
+    return _VT_OK
+
+
 def _use_color() -> bool:
     if os.environ.get("NO_COLOR"):
         return False
     try:
-        return sys.stdout.isatty()
+        if not sys.stdout.isatty():
+            return False
     except Exception:
         return False
+    return _ensure_vt()
 
 
 def _c(text: str, *names: str) -> str:
