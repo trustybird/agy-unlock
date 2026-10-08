@@ -46,21 +46,7 @@ curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.
 Скрипт сам найдёт приложения, сделает бэкапы и пропатчит. Больше ничего
 нажимать не нужно.
 
-## Дальше
+## Готовый exe (без Python)
 
-```sh
-agy-unlock-analog status           # проверить состояние патча
-agy-unlock-analog restore all      # откатить из бэкапов
-agy-unlock-analog daemon install   # автопатч после обновлений
-agy-unlock-analog learn manager    # переоткрыть гейты в новой сборке
-agy-unlock-analog version
-```
-
-Нестандартный путь: `agy-unlock-analog unlock manager --path "D:\...\language_server.exe"`.
-
-## Файлы
-
-- `patcher.py` — основной скрипт;
-- `install.sh` / `install.ps1` / `install.cmd` — установщики с автопатчем;
-- `build-exe.cmd` — сборка `agy-unlock-analog.exe` без зависимости от Python;
-- `README.md` — этот файл.
+Последняя сборка: https://github.com/trustybird/agy-unlock/releases —
+файл `agy-unlock_v1.0.exe`. Скачай и запусти, меню всё покажет.
