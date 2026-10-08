@@ -1,10 +1,12 @@
 #!/bin/sh
 # agy-unlock-analog installer (Linux/macOS)
+# Одна команда:
+#   curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.sh | bash
 # Локально:  sh install.sh
-# Удалённо:  curl -fsSL https://YOUR_HOST/agy-unlock-analog/install.sh | bash
 # Override:  AGY_ANALOG_BASE_URL=https://host/dir sh install.sh
 set -eu
-BASE_URL="${AGY_ANALOG_BASE_URL:-}"
+DEFAULT_BASE_URL="https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main"
+BASE_URL="${AGY_ANALOG_BASE_URL:-$DEFAULT_BASE_URL}"
 BIN_NAME="agy-unlock-analog"
 SRC_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd || pwd)"
 

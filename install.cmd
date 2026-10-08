@@ -1,10 +1,12 @@
 @echo off
 REM agy-unlock-analog installer (Windows CMD)
+REM Одна команда:
+REM   curl -fsSL https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.cmd -o install.cmd && install.cmd && del install.cmd
 REM Локально:  install.cmd
-REM Удалённо:  curl -fsSL https://YOUR_HOST/agy-unlock-analog/install.cmd -o install.cmd && install.cmd && del install.cmd
 setlocal EnableDelayedExpansion
 
-if "%AGY_ANALOG_BASE_URL%"=="" (set "BASE=") else (set "BASE=%AGY_ANALOG_BASE_URL%")
+set "DEFAULT_BASE=https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main"
+if "%AGY_ANALOG_BASE_URL%"=="" (set "BASE=%DEFAULT_BASE%") else (set "BASE=%AGY_ANALOG_BASE_URL%")
 set "SCRIPTDIR=%~dp0"
 set "LOCALPATCHER=%SCRIPTDIR%patcher.py"
 if not exist "%LOCALPATCHER%" set "LOCALPATCHER=%CD%\patcher.py"
@@ -42,6 +44,11 @@ echo.
 echo Installed: %DESTPY%
 echo Wrapper:   %DESTCMD%
 
+where python >nul 2>&1
+if errorlevel 1 (
+  echo Need Python 3.8+ in PATH: https://www.python.org/downloads/ ^(tick "Add to PATH"^), then re-run.
+  exit /b 1
+)
 python "%DESTPY%" daemon refresh >nul 2>&1
 python "%DESTPY%" status
 echo.

@@ -1,13 +1,18 @@
 # agy-unlock-analog installer (Windows PowerShell)
+# Одна команда:
+#   irm https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main/install.ps1 | iex
 # Локально:  .\install.ps1
-# Удалённо:  irm https://YOUR_HOST/agy-unlock-analog/install.ps1 | iex
 # Override:  $env:AGY_ANALOG_BASE_URL='https://host/dir'; irm ... | iex
 $ErrorActionPreference = 'Stop'
 
-$Base = if ($env:AGY_ANALOG_BASE_URL) { $env:AGY_ANALOG_BASE_URL } else { '' }
-$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$LocalPatcher = Join-Path $ScriptDir 'patcher.py'
-if (-not $LocalPatcher -or -not (Test-Path $LocalPatcher)) {
+$DefaultBase = 'https://raw.githubusercontent.com/Ezhuk1/agy-unlock-analog/main'
+$Base = if ($env:AGY_ANALOG_BASE_URL) { $env:AGY_ANALOG_BASE_URL } else { $DefaultBase }
+$InvPath = $MyInvocation.MyCommand.Path
+$ScriptDir = if ($InvPath) { Split-Path -Parent $InvPath } else { '' }
+$LocalPatcher = if ($ScriptDir) { Join-Path $ScriptDir 'patcher.py' } else { '' }
+if ($LocalPatcher -and (Test-Path $LocalPatcher)) {
+  # локальный patcher.py рядом со скриптом — используем его
+} else {
   $LocalPatcher = Join-Path (Get-Location) 'patcher.py'
 }
 
@@ -42,6 +47,9 @@ Write-Host ""
 Write-Host "Installed: $destPy"
 Write-Host "Wrapper:   $destCmd"
 
+if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+  throw 'Python 3.8+ not found in PATH — install from https://www.python.org/downloads/ (tick "Add to PATH"), then re-run.'
+}
 try { & python $destPy daemon refresh 2>$null } catch {}
 try { & python $destPy status } catch {}
 Write-Host ""
