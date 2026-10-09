@@ -777,6 +777,69 @@ def _elf_info(f, fsize):
     return _norm_ranges(ranges, fsize), _arch_name(machine)
 
 
+def _macho_slice_info(f, fsize, base, slice_size):
+    magic = _read_exact(f, base, 4)
+    if magic == b"\xcf\xfa\xed\xfe":
+        endian = "<"
+    elif magic == b"\xfe\xed\xfa\xcf":
+        endian = ">"
+    else:
+        raise ValueError("unsupported Mach-O slice")
+    header = _read_exact(f, base, 32)
+    arch = _arch_name(struct.unpack_from(endian + "I", header, 4)[0])
+    ncmds = struct.unpack_from(endian + "I", header, 16)[0]
+    pos, ranges = base + 32, []
+    for _ in range(ncmds):
+        cmd, cmdsz = struct.unpack(endian + "II", _read_exact(f, pos, 8))
+        if cmdsz < 8 or pos + cmdsz > base + slice_size:
+            raise ValueError("invalid Mach-O load command")
+        if cmd == 0x19:  # LC_SEGMENT_64
+            seg = _read_exact(f, pos, cmdsz)
+            nsec = struct.unpack_from(endian + "I", seg, 64)[0]
+            if 72 + nsec * 80 > cmdsz:
+                raise ValueError("invalid Mach-O section table")
+            sp = 72
+            for _ in range(nsec):
+                sec = seg[sp:sp + 80]
+                sname = sec[:16].split(b"\0", 1)[0]
+                gname = sec[16:32].split(b"\0", 1)[0]
+                size = struct.unpack_from(endian + "Q", sec, 40)[0]
+                off = struct.unpack_from(endian + "I", sec, 48)[0]
+                flags = struct.unpack_from(endian + "I", sec, 64)[0]
+                is_code = ((gname, sname) == (b"__TEXT", b"__text")
+                           or flags & (0x80000000 | 0x00000400))
+                if is_code:
+                    ranges.append((base + off, base + off + size))
+                sp += 80
+        pos += cmdsz
+    return _norm_ranges(ranges, fsize), arch
+
+
+def _macho_executable_info(f, fsize):
+    magic = _read_exact(f, 0, 4)
+    if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+        return _macho_slice_info(f, fsize, 0, fsize)
+    fat = {b"\xca\xfe\xba\xbe": (">", False), b"\xbe\xba\xfe\xca": ("<", False),
+           b"\xca\xfe\xba\xbf": (">", True), b"\xbf\xba\xfe\xca": ("<", True)}.get(magic)
+    if not fat:
+        raise ValueError("unsupported Mach-O header")
+    endian, is64 = fat
+    count = struct.unpack(endian + "I", _read_exact(f, 4, 4))[0]
+    esz = 32 if is64 else 20
+    ranges, arches = [], []
+    for i in range(count):
+        e = _read_exact(f, 8 + i * esz, esz)
+        if is64:
+            off, sz = struct.unpack_from(endian + "QQ", e, 8)
+        else:
+            off, sz = struct.unpack_from(endian + "II", e, 8)
+        sr, sa = _macho_slice_info(f, fsize, off, sz)
+        ranges += sr
+        arches.append(sa)
+    arch = arches[0] if arches and arches[0] and all(a == arches[0] for a in arches) else None
+    return _norm_ranges(ranges, fsize), arch
+
+
 def exec_info(path: Path):
     """(ranges, arch) кодовых секций PE/ELF/Mach-O. При неудаче — весь файл, arch None."""
     try:
@@ -787,6 +850,10 @@ def exec_info(path: Path):
                 return _pe_info(f, fsize)
             if magic == b"\x7fELF":
                 return _elf_info(f, fsize)
+            if magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                         b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                         b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+                return _macho_executable_info(f, fsize)
     except (OSError, ValueError, struct.error):
         pass
     try:
@@ -942,6 +1009,8 @@ def find_ide_mains() -> list[Path]:
             if sys.platform == "darwin":
                 cands += [Path(p) for p in _g.glob(
                     str(root / "*ntigravity*.app" / "Contents" / "Resources" / "app" / "out" / "main.js"))]
+                cands += [Path(p) for p in _g.glob(
+                    str(root / "*ntigravity*.app" / "Contents" / "resources" / "app" / "out" / "main.js"))]
     return _dedup(cands)
 
 
@@ -1079,6 +1148,16 @@ def _ensure_backup(target: Path) -> str | None:
         shutil.copy2(target, bp)
         return None
     except OSError as e:
+        import errno as _errno
+        if sys.platform == "darwin" and getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
+            if _mac_ensure_writable(target):
+                try:
+                    shutil.copy2(target, bp)
+                    return None
+                except OSError as e2:
+                    print(f"    [macos] {_mac_sudo_hint(target)}")
+                    return f"backup-error: {e2}"
+            print(f"    [macos] {_mac_sudo_hint(target)}")
         return f"backup-error: {e}"
 
 
@@ -1091,6 +1170,80 @@ def _locked_win(path: Path) -> bool:
             return False
     except OSError:
         return True
+
+
+def _mac_run(cmd: list[str]) -> tuple[int, str]:
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace", timeout=120)
+        return r.returncode, ((r.stdout or "") + (r.stderr or ""))[-1000:]
+    except (OSError, ValueError) as e:
+        return 127, str(e)
+
+
+def _mac_app_bundle(path: Path):
+    """Ближайший *.app выше файла (или None)."""
+    try:
+        cur = path.resolve().parent
+    except OSError:
+        return None
+    while True:
+        if cur.name.endswith(".app") and (cur / "Contents").is_dir():
+            return cur
+        parent = cur.parent
+        if parent == cur:
+            return None
+        cur = parent
+
+
+def _mac_ensure_writable(path: Path) -> bool:
+    """Снимает uchg-флаг (причина EPERM внутри .app). True если теперь пишется."""
+    rc, _ = _mac_run(["chflags", "nouchg", str(path)])
+    if rc != 0:
+        return False
+    try:
+        with path.open("r+b"):
+            return True
+    except OSError:
+        return False
+
+
+def _mac_sudo_hint(path: Path) -> str:
+    return (f"macOS blocked writing {path}. Close the app, then either "
+            f"re-run with sudo or clear flags first: "
+            f"sudo chflags -R nouchg {str(_mac_app_bundle(path) or path)}")
+
+
+def _mac_write(path: Path, data: bytes):
+    """Запись с одной попыткой через chflags на macOS. None ок, иначе текст ошибки."""
+    try:
+        path.write_bytes(data)
+        return None
+    except OSError as e:
+        import errno as _errno
+        if sys.platform == "darwin" and getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
+            if _mac_ensure_writable(path):
+                try:
+                    path.write_bytes(data)
+                    return None
+                except OSError as e2:
+                    print(f"    [macos] {_mac_sudo_hint(path)}")
+                    return f"write-error: {e2}"
+            print(f"    [macos] {_mac_sudo_hint(path)}")
+        return f"write-error: {e}"
+
+
+def _mac_finalize(path: Path):
+    """Переподпись после патча: иначе macOS убьёт бинарь (SIGKILL/Gatekeeper)."""
+    if sys.platform != "darwin":
+        return
+    target = _mac_app_bundle(path) or path
+    _mac_run(["xattr", "-dr", "com.apple.quarantine", str(target)])
+    rc, out = _mac_run(["codesign", "--force", "--deep", "--sign", "-", str(target)])
+    if rc == 0:
+        print(f"    [macos] re-signed {target.name}")
+    else:
+        print(f"    [macos] codesign failed (app may not launch): {out[-300:]}")
 
 
 def _apply_fixes(data: bytes, off: int, fixes) -> bytes:
@@ -1145,12 +1298,14 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
             ba = bytearray(new)
             ba[off + delta: off + delta + len(blob)] = blob
             new = bytes(ba)
-    try:
-        target_path.write_bytes(new)
-    except OSError as e:
-        return f"write-error: {e}"
+    werr = _mac_write(target_path, new)
+    if werr:
+        return werr
     st2, _, _ = scan_manager(target_path)
-    return "patched" if st2 == "patched" else f"verify-failed:{st2}"
+    if st2 != "patched":
+        return f"verify-failed:{st2}"
+    _mac_finalize(target_path)
+    return "patched"
 
 
 def do_patch_cli(target_path: Path) -> str:
@@ -1178,12 +1333,14 @@ def do_patch_cli(target_path: Path) -> str:
         if err:
             return err
         new = _apply_fixes(data, off, g.fixes)
-        try:
-            target_path.write_bytes(new)
-        except OSError as e:
-            return f"write-error: {e}"
+        werr = _mac_write(target_path, new)
+        if werr:
+            return werr
         st2 = scan_cli(target_path)[0]
-        return "patched" if st2 == "patched" else f"verify-failed:{st2}"
+        if st2 != "patched":
+            return f"verify-failed:{st2}"
+        _mac_finalize(target_path)
+        return "patched"
     return f"pattern-not-found:{locals().get('last', 'no-gate-matched')}"
 
 
@@ -1222,17 +1379,19 @@ def do_patch_ide(target_path: Path) -> str:
     if err:
         return err
     new = IDE_STOCK_RE.sub(lambda m: m.group(1) + "true", text, count=1)
-    try:
-        target_path.write_text(new, encoding="utf-8")
-    except OSError as e:
-        return f"write-error: {e}"
+    werr = _mac_write(target_path, new.encode("utf-8"))
+    if werr:
+        return werr
     for c in _ide_cache_dirs():
         try:
             if c.is_dir():
                 shutil.rmtree(c, ignore_errors=True)
         except OSError:
             pass
-    return "patched" if scan_ide(target_path)[0] == "patched" else "verify-failed"
+    if scan_ide(target_path)[0] != "patched":
+        return "verify-failed"
+    _mac_finalize(target_path)
+    return "patched"
 
 
 def do_restore(target_path: Path) -> str:

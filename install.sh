@@ -51,9 +51,9 @@ else
 fi
 
 chmod +x "$dest"
-# shebang is enough; check python3
+# shebang is enough; check python3 (macOS 12.3+ ships without it)
 if ! command -v python3 >/dev/null 2>&1; then
-  err "need python3 (https://www.python.org/downloads/)"
+  err "need python3: macOS - https://www.python.org/downloads/ ; Linux - apt install python3"
 fi
 
 printf '\nInstalled: %s\n' "$dest"

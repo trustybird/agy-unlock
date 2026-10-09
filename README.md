@@ -46,6 +46,15 @@ curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.
 Скрипт сам найдёт приложения, сделает бэкапы и пропатчит. Больше ничего
 нажимать не нужно.
 
+## macOS: особенности
+
+- Нужен Python 3.8+ (в системе его нет — ставь с python.org).
+- Запись в `/Applications` требует прав: закрой Antigravity и при
+  отказе запускай с `sudo` (скрипт сам подскажет).
+- После патча бинарь переподписывается автоматически (`codesign -s -`,
+  снимается карантин) — иначе macOS не даст приложению запуститься.
+- Apple Silicon и Intel поддерживаются (сигнатуры под каждую архитектуру).
+
 ## Готовый exe (без Python)
 
 Последняя сборка: https://github.com/trustybird/agy-unlock/releases —
