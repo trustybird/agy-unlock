@@ -53,7 +53,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.1.0-analog"
+VERSION = "2.1.1-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -67,9 +67,39 @@ class SigAmbiguous(LookupError):
     pass
 
 
+def _as_ranges(ranges):
+    """Приводит диапазоны к ((start, end), ...). Мусор отбрасывается —
+    сканер обязан вернуть unknown, а не уронить трейсбэк."""
+    if not ranges:
+        return ()
+    if isinstance(ranges, (bytes, bytearray, str)):
+        return ()
+    try:
+        items = list(ranges)
+    except TypeError:
+        return ()
+    # плоская пара (start, end) вместо списка пар
+    if len(items) == 2 and all(isinstance(x, int) and not isinstance(x, bool) for x in items):
+        a, b = items
+        return ((a, b),) if a < b else ()
+    out = []
+    for it in items:
+        try:
+            a, b = it
+        except (TypeError, ValueError):
+            continue
+        if isinstance(a, bool) or isinstance(b, bool):
+            continue
+        if not isinstance(a, int) or not isinstance(b, int):
+            continue
+        if a < b:
+            out.append((a, b))
+    return tuple(out)
+
+
 def _unique_search(pattern: re.Pattern, data: bytes, ranges, label: str):
     found = None
-    for start, end in ranges:
+    for start, end in _as_ranges(ranges):
         pos = start
         while pos < end:
             m = pattern.search(data, pos, end)
@@ -135,7 +165,7 @@ def _elig_find(data: bytes, ranges):
     возвращает (kind, offset). kind: patched|unpatched. Бросает SigError."""
     needle = bytes([0x7F, 0x0D, 0x0F, 0x1F, 0x40, 0x00, 0x48, 0x85, 0xC0])
     cands = []
-    for rs, re_ in ranges:
+    for rs, re_ in _as_ranges(ranges):
         pos = data.find(needle, rs, re_)
         while pos != -1:
             cands.append(pos)
@@ -368,13 +398,13 @@ def _score_window(window: bytes, template: bytes, volatile) -> float:
 
 
 def _in_ranges(off: int, ln: int, ranges) -> bool:
-    return any(rs <= off and off + ln <= re_ for rs, re_ in ranges)
+    return any(rs <= off and off + ln <= re_ for rs, re_ in _as_ranges(ranges))
 
 
 def learn_enum_mgr_auth(data: bytes, ranges):
     """Relaxed-кандидаты hasValidAuth: cmp byte[.+8],0 + short-jcc + mov-тейл."""
     out = []
-    for rs, re_ in ranges:
+    for rs, re_ in _as_ranges(ranges):
         pos = data.find(b"\x80\x78\x08\x00", rs, re_)
         while pos != -1:
             win = data[pos:pos + 28]
@@ -394,7 +424,7 @@ def learn_enum_mgr_auth(data: bytes, ranges):
 def learn_enum_mgr_elig(data: bytes, ranges):
     """Relaxed-кандидаты eligibility: test rax,rax ... mov r10-стек ... test r10,r10."""
     out = []
-    for rs, re_ in ranges:
+    for rs, re_ in _as_ranges(ranges):
         pos = data.find(b"\x48\x85\xc0", rs, re_)
         while pos != -1:
             win = data[pos:pos + 64]
@@ -410,7 +440,7 @@ def learn_enum_mgr_elig(data: bytes, ranges):
 
 def learn_enum_cli_x64(data: bytes, ranges):
     out = []
-    for rs, re_ in ranges:
+    for rs, re_ in _as_ranges(ranges):
         pos = data.find(b"\x48\x85\xc0", rs, re_)
         while pos != -1:
             win = data[pos:pos + 24]
@@ -2126,4 +2156,17 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (KeyboardInterrupt, BrokenPipeError):
+        raise SystemExit(130)
+    except SystemExit:
+        raise
+    except Exception as e:
+        try:
+            print(f"[!] internal error: {type(e).__name__}: {e}")
+            print(f"    version: {TOOL_NAME} {VERSION} on {sys.platform}")
+            print("    send this text to the author - the file was left untouched")
+        except Exception:
+            pass
+        raise SystemExit(2)
