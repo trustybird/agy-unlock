@@ -1,0 +1,9 @@
+# Не даём редакторам и Windows сломать переводы строк:
+# shell-скрипты строго LF (иначе bash/zsh падают), батники строго CRLF.
+*.sh text eol=lf
+*.ps1 text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.gitignore text eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf
