@@ -36,11 +36,32 @@ agy-unlock-analog v2 — открытый аналог Antigravity Unlock.
   проверить не на чем (нет ARM-бинарей) — помечены experimental.
 - IDE JS (vezlin tolerant + QNIX single-replace):
     resetIsTierGCPTos()[ws][,;][ws](this|X.y...).isGoogleInternal -> true
+- RENAME-гейт (подход confeden/Antigravity, 2026-11; код не копировался —
+  переимплементация идеи из их публичного README):
+    ineligible -> inexigible, одна длина, по всему файлу. Меняются и
+    protobuf-дескриптор, и тег структуры Go — клиент больше не получает
+    поле, по которому гейтится. Не зависит от раскладки кода и архитектуры,
+    поэтому служит страховкой, когда байтовые гейты не совпали.
+- ASAR (подход confeden): desktop >= 2.4 кладёт шелл в resources/app.asar.
+  Читаем dist/main.js прямо из архива; если это модульный шелл v2.4+
+  (./languageServer + ./ipcHandlers, без легаси auth-строк) — auth уже в
+  language_server и JS-патч не нужен вовсе; если старый — распаковываем
+  app.asar в resources/app (Electron предпочитает каталог) и архив
+  переименовываем в .bak. Откат возвращает как было.
+- Новые цели: language_server* с платформенными суффиксами в
+  extensions/antigravity/bin; IDE 2.6.0 качает бэкенд в ~/.gemini/bin.
+
+Не переносится из confeden намеренно: переименование https_proxy ->
+AG_LS_PROXY нужно только их локальной прокси-службе (127.0.0.1:53129),
+которой здесь нет — без неё переименование лишь ломало бы lowercase
+https_proxy на Linux.
 
 Атрибуция: байт-сигнатуры MGR/CLI/ARM/IDE — AvenCores Open AG Patcher
 (GPL-3.0) / QNIX-Dev eligibility-antigravity-patcher (MIT) / vezlin1
-antigravity-bypass-russia (MIT). Каркас сканера секций/бэкапов — по мотивам
-QNIX manager.py (MIT). Весь код здесь — заново, только stdlib, без телеметрии.
+antigravity-bypass-russia (MIT); подходы rename/asar/new-arch —
+confeden/Antigravity (restricted license, идеи из README, без кода).
+Каркас сканера секций/бэкапов — по мотивам QNIX manager.py (MIT).
+Весь код здесь — заново, только stdlib, без телеметрии.
 """
 from __future__ import annotations
 import argparse
@@ -53,7 +74,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.1.1-analog"
+VERSION = "2.2.0-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -281,11 +302,154 @@ IDE_STOCK_RE = re.compile(
 IDE_PATCHED_RE = re.compile(r"resetIsTierGCPTos\(\)[ \t\r\n]*[,;][ \t\r\n]*true")
 
 
-# -- ide main.js (vezlin tolerant regex + QNIX single-replace) --
-IDE_STOCK_RE = re.compile(
-    r"(resetIsTierGCPTos\(\)[ \t\r\n]*[,;][ \t\r\n]*)(?:this|[A-Za-z_$0-9]+)"
-    r"(?:\.[A-Za-z_$0-9]+)*\.isGoogleInternal")
-IDE_PATCHED_RE = re.compile(r"resetIsTierGCPTos\(\)[ \t\r\n]*[,;][ \t\r\n]*true")
+# -- desktop v2.4+: модульный шелл (подход confeden/Antigravity) --
+# С 2.4 auth целиком в бинаре language_server, dist/main.js только заводит
+# шелл. Проверка проверяется на desktop-целях (dist/main.js, app.asar) и
+# честно говорит «JS-патч не нужен»: auth-гейты патчит бинарь.
+
+def is_new_desktop_architecture(text: str) -> bool:
+    modular = "./languageServer" in text and "./ipcHandlers" in text
+    legacy = ("_handleAuthErrorResponse" in text or "getUserStatus" in text
+              or '"AUTH_SUCCESS"' in text or '"SET_INELIGIBLE"' in text)
+    return modular and not legacy
+
+
+# -- asar (формат архива Electron; подход confeden/Antigravity) --
+
+def asar_read_entry(asar: Path, rel_path: str) -> bytes | None:
+    """Читает файл из app.asar без распаковки. rel_path — через '/'."""
+    try:
+        import json as _json
+        with asar.open("rb") as f:
+            head = f.read(16)
+            if len(head) != 16:
+                return None
+            _u1, header_size, _u2, json_size = struct.unpack("<IIII", head)
+            if json_size <= 0 or header_size <= 0:
+                return None
+            tree = _json.loads(f.read(json_size).decode("utf-8"))
+            node = tree
+            for part in rel_path.split("/"):
+                if not isinstance(node, dict):
+                    return None
+                node = node.get("files", {}).get(part)
+            # каталоги полезной нагрузки не несут; unpacked лежат на диске рядом
+            if not isinstance(node, dict) or "files" in node or node.get("unpacked"):
+                return None
+            if "offset" not in node or "size" not in node:
+                return None
+            f.seek(8 + header_size + int(node["offset"]))
+            return f.read(int(node["size"]))
+    except (OSError, ValueError, KeyError, UnicodeError):
+        return None
+
+
+def asar_extract(asar: Path, app_dir: Path) -> str | None:
+    """Распаковывает app.asar в resources/app и переименовывает архив в .bak.
+
+    Electron предпочитает resources/app, если каталог есть, поэтому патчить
+    можно распакованное, а .bak — исходное состояние. На любой ошибке
+    недописанный каталог удаляется, архив не трогается. None — ок."""
+    if app_dir.exists():
+        return None
+    try:
+        import json as _json
+        with asar.open("rb") as f:
+            head = f.read(16)
+            if len(head) != 16:
+                raise ValueError("asar header too short")
+            _u1, header_size, _u2, json_size = struct.unpack("<IIII", head)
+            if json_size <= 0 or header_size <= 0:
+                raise ValueError("bad asar header")
+            tree = _json.loads(f.read(json_size).decode("utf-8"))
+            base = 8 + header_size
+
+            def walk(node: dict, dest: Path) -> None:
+                for name, child in node.get("files", {}).items():
+                    p = dest / name
+                    if child.get("unpacked"):
+                        continue  # лежат рядом в app.asar.unpacked
+                    if "files" in child:
+                        walk(child, p)
+                        continue
+                    f.seek(base + int(child["offset"]))
+                    remaining = int(child["size"])
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    with p.open("wb") as out:
+                        while remaining > 0:
+                            chunk = f.read(min(remaining, 1 << 20))
+                            if not chunk:
+                                raise ValueError("asar truncated")
+                            out.write(chunk)
+                            remaining -= len(chunk)
+
+            walk(tree, app_dir)
+    except (OSError, ValueError, KeyError, UnicodeError) as e:
+        shutil.rmtree(app_dir, ignore_errors=True)
+        return f"asar-extract-error: {e}"
+    unpacked = asar.with_name(asar.name + ".unpacked")
+    if unpacked.is_dir():
+        try:
+            shutil.copytree(unpacked, app_dir, dirs_exist_ok=True)
+        except OSError as e:
+            shutil.rmtree(app_dir, ignore_errors=True)
+            return f"asar-unpacked-copy-error: {e}"
+    bak = asar.with_name(asar.name + ".bak")
+    try:
+        asar.rename(bak)
+    except OSError as e:
+        shutil.rmtree(app_dir, ignore_errors=True)
+        return f"asar-rename-error: {e}"
+    return None
+
+
+def asar_restore(asar: Path) -> str:
+    """Возврат desktop: убрать распакованное resources/app, вернуть .bak -> app.asar."""
+    bak = asar.with_name(asar.name + ".bak")
+    if not bak.exists():
+        return "no-backup"
+    app_dir = asar.parent / "app"
+    try:
+        if app_dir.exists():
+            shutil.rmtree(app_dir)
+        bak.rename(asar)
+        return "restored-asar"
+    except OSError as e:
+        return f"restore-error: {e}"
+
+
+# -- rename-гейт (подход confeden/Antigravity) --
+# У слова-замены та же длина, что у исходного: смещения, релокации и размер
+# PE не меняются, откат из .agybak байт-в-байт. Меняются и protobuf-дескриптор,
+# и тег структуры Go — в JSON, который парсит клиент, поле больше не приходит.
+# Независим от раскладки кода и архитектуры (x64/arm64), поэтому страхует
+# байтовые гейты на сборках, где код уехал. Ищется по всему файлу: литералы
+# живут и в кодовых, и в данных секциях.
+RENAME_FROM = b"ineligible"
+RENAME_TO = b"inexigible"
+
+
+def rename_state(data: bytes) -> tuple[str, int]:
+    """('patched'|'unpatched'|'partial'|'unknown', сколько вхождений).
+
+    unknown = ни того, ни другого слова: сборка, где поле переехало или
+    названо иначе. Для байтовых гейтов это не приговор — считаем N/A."""
+    n_from = data.count(RENAME_FROM)
+    n_to = data.count(RENAME_TO)
+    if n_from and n_to:
+        # оба слова: чужой/частичный патч. "inexigible" не содержит
+        # "ineligible", так что replace_all доведёт до полного rename.
+        return ("partial", n_from + n_to)
+    if n_to:
+        return ("patched", n_to)
+    if n_from:
+        return ("unpatched", n_from)
+    return ("unknown", 0)
+
+
+def _apply_rename(data: bytes) -> tuple[bytes, int]:
+    new = data.replace(RENAME_FROM, RENAME_TO)
+    return new, data.count(RENAME_FROM)
 
 
 # --------------------------------------- signature packs + learn ---
@@ -487,10 +651,9 @@ def cmd_learn(sel: str, explicit: str | None, apply: bool, auto: bool):
     for kind, path in targets.items():
         print(f"[*] learn {kind}: {path}")
         if kind == "ide":
-            try:
-                text = path.read_text(encoding="utf-8")
-            except OSError as e:
-                print(f"    read-error: {e}")
+            text = _ide_text_for(path)
+            if text is None:
+                print("    read-error: main.js не прочитан (asar без dist/main.js?)")
                 rc = 1
                 continue
             sites = [(m.start(), m.group(0)[-60:]) for m in
@@ -894,17 +1057,26 @@ def exec_info(path: Path):
 
 # --------------------------------------------------- discovery ---
 
+def _is_junk_name(p: Path) -> bool:
+    """Бэкапы и темпы патчей не считаются целями ни под каким именем."""
+    n = p.name.lower()
+    return (n.endswith((".agybak", ".agybak.prev", ".ag_backup", ".agtmp",
+                        ".asar.bak"))
+            or ".agtmp." in n)
+
+
 def _dedup(paths):
     seen, out = set(), []
     for p in paths:
-        if p and p.exists():
-            try:
-                k = os.path.normcase(str(p.resolve()))
-            except OSError:
-                k = str(p)
-            if k not in seen:
-                seen.add(k)
-                out.append(p)
+        if not p or not p.exists() or _is_junk_name(p):
+            continue
+        try:
+            k = os.path.normcase(str(p.resolve()))
+        except OSError:
+            k = str(p)
+        if k not in seen:
+            seen.add(k)
+            out.append(p)
     out.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0, reverse=True)
     return out
 
@@ -958,6 +1130,29 @@ def _win_roots():
     return [p for p in out if p.is_dir()]
 
 
+def _ls_glob_patterns(root: Path, os_name: str) -> list[str]:
+    """Glob-паттерны language_server* для одного корня. Звёздочный хвост
+    ловит платформенные суффиксы (language_server_windows_x64.exe и т.п.),
+    которые меняются между сборками, — решает всё равно сигнатурный скан."""
+    import glob as _g
+    rel_bin = Path("resources") / "bin"
+    ext_bin = Path("resources") / "app" / "extensions" / "antigravity" / "bin"
+    pats = []
+    if os_name == "nt":
+        for rel in (rel_bin, ext_bin):
+            pats.append(str(root / "*ntigravity*" / rel / "language_server*"))
+            pats.append(str(root / "*ntigravity*" / "*" / rel / "language_server*"))
+    elif os_name == "darwin":
+        for base in (root / "*ntigravity*.app" / "Contents" / "Resources",
+                     root / "*ntigravity*.app" / "Contents" / "resources"):
+            pats.append(str(base / rel_bin / "language_server*"))
+            pats.append(str(base / ext_bin / "language_server*"))
+    else:
+        for rel in (rel_bin, ext_bin):
+            pats.append(str(root / "*ntigravity*" / rel / "language_server*"))
+    return pats
+
+
 def find_manager_bins() -> list[Path]:
     rel = Path("resources") / "bin" / ("language_server.exe" if os.name == "nt" else "language_server")
     cands: list[Path] = []
@@ -971,6 +1166,9 @@ def find_manager_bins() -> list[Path]:
             d = root / rel
             if d.is_file():
                 cands.append(d)
+        for root in _win_roots():
+            for pat in _ls_glob_patterns(root, "nt"):
+                cands += [Path(p) for p in __import__("glob").glob(pat)]
     else:
         home = Path.home()
         roots = [Path("/opt"), Path("/usr/share"), Path("/usr/lib"),
@@ -984,10 +1182,14 @@ def find_manager_bins() -> list[Path]:
                     continue
                 cands += [Path(p) for p in __import__("glob").glob(str(root / "*ntigravity*.app" / mac_rel))]
                 cands += [Path(p) for p in __import__("glob").glob(str(root / "*ntigravity*.app" / mac_rel2))]
+                for pat in _ls_glob_patterns(root, "darwin"):
+                    cands += [Path(p) for p in __import__("glob").glob(pat)]
         for root in roots:
             if not root.is_dir():
                 continue
             cands += [Path(p) for p in __import__("glob").glob(str(root / "*ntigravity*" / rel))]
+            for pat in _ls_glob_patterns(root, "posix"):
+                cands += [Path(p) for p in __import__("glob").glob(pat)]
     return _dedup(cands)
 
 
@@ -997,6 +1199,13 @@ def find_cli_bins() -> list[Path]:
     w = shutil.which("agy")
     if w:
         cands.append(Path(w))
+    # IDE 2.6.0 не несёт language_server: расширение agy скачивает бэкенд
+    # в ~/.gemini/bin при первом старте — этот файл тоже цель (confeden).
+    gem = Path.home() / ".gemini" / "bin"
+    for nm in ("agy.exe", "agy"):
+        p = gem / nm
+        if p.is_file():
+            cands.append(p)
     if os.name == "nt":
         for root in _win_roots():
             import glob as _g
@@ -1020,12 +1229,20 @@ def find_ide_mains() -> list[Path]:
            else Path("Contents") / "Resources" / "app" / "out" / "main.js"
            if sys.platform == "darwin"
            else Path("resources") / "app" / "out" / "main.js")
+    desktop_rel = (Path("resources") / "app" / "dist" / "main.js" if os.name != "darwin"
+                   else Path("Contents") / "Resources" / "app" / "dist" / "main.js")
+    asar_rel = Path("resources") / "app.asar" if os.name != "darwin" \
+        else Path("Contents") / "Resources" / "app.asar"
     cands: list[Path] = []
     if os.name == "nt":
         for root in _win_roots():
             import glob as _g
             cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / rel))]
             cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / "*" / rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / desktop_rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / "*" / desktop_rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / asar_rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / "*" / asar_rel))]
     else:
         home = Path.home()
         roots = [Path("/opt"), Path("/usr/share"), Path("/usr/lib"), home / ".local" / "share"]
@@ -1036,12 +1253,28 @@ def find_ide_mains() -> list[Path]:
                 continue
             import glob as _g
             cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / desktop_rel))]
+            cands += [Path(p) for p in _g.glob(str(root / "*ntigravity*" / asar_rel))]
             if sys.platform == "darwin":
                 cands += [Path(p) for p in _g.glob(
                     str(root / "*ntigravity*.app" / "Contents" / "Resources" / "app" / "out" / "main.js"))]
                 cands += [Path(p) for p in _g.glob(
                     str(root / "*ntigravity*.app" / "Contents" / "resources" / "app" / "out" / "main.js"))]
-    return _dedup(cands)
+                cands += [Path(p) for p in _g.glob(
+                    str(root / "*ntigravity*.app" / "Contents" / "Resources" / "app.asar"))]
+                cands += [Path(p) for p in _g.glob(
+                    str(root / "*ntigravity*.app" / "Contents" / "resources" / "app.asar"))]
+    # приоритет: распакованный main.js проще патчить, asar — крайний случай
+    out = _dedup(cands)
+
+    def _rank(p: Path) -> int:
+        if p.suffix == ".asar":
+            return 2
+        if p.parent.name == "dist":
+            return 1
+        return 0
+
+    return sorted(out, key=_rank)
 
 
 def find_all_targets():
@@ -1060,7 +1293,9 @@ def find_all_targets():
 # ----------------------------------------------------- scan ---
 
 def scan_manager(path: Path):
-    """Статус менеджера по двум гейтам: patched|unpatched|partial-*|unknown."""
+    """Статус менеджера по байтовым гейтам + rename: patched|unpatched|partial-*|unknown.
+    rename в состоянии patched засчитывается как самостоятельный механизм: если
+    байтовые гейты в сборке не нашлись, а rename на месте — сборка разблокирована."""
     try:
         data = path.read_bytes()
     except OSError:
@@ -1073,6 +1308,9 @@ def scan_manager(path: Path):
         return ("unknown", {}, {})
     resolved = resolve_manager_gates(data, ranges, arch)
     results = {k: (v[0], v[1]) for k, v in resolved.items()}
+    rst, _n = rename_state(data)
+    if rst != "unknown":
+        results["rename"] = (rst, None)
     if not results:
         return ("unknown", {}, {})
     states = {v[0] for v in results.values()}
@@ -1098,22 +1336,61 @@ def scan_cli(path: Path):
     cands = [CLI_X64_V2, CLI_X64_V1, CLI_ARM64] if arch in (None, "x64") else [CLI_ARM64]
     if arch == "arm64":
         cands = [CLI_ARM64]
+    results = {}
     for g in cands:
         if g.arch is not None and arch is not None and g.arch != arch:
             continue
         try:
             st, off = g.state(data, ranges)
-            return (st, {"cli": (st, off, g)}, {})
+            results["cli"] = (st, off)
+            break
         except (SigError, SigAmbiguous):
             continue
+    rst, _n = rename_state(data)
+    if rst != "unknown":
+        results["rename"] = (rst, None)
+    if not results:
+        return ("unknown", {}, {})
+    states = {v[0] for v in results.values()}
+    if states == {"patched"}:
+        return ("patched", results, {})
+    if states == {"unpatched"}:
+        return ("unpatched", results, {})
+    if "patched" in states or "unpatched" in states:
+        return ("partial-" + "+".join(f"{k}={v[0]}" for k, v in sorted(results.items())),
+                results, {})
     return ("unknown", {}, {})
 
 
-def scan_ide(path: Path):
+def _ide_text_for(path: Path) -> str | None:
+    """Текст main.js для IDE/desktop-цели: с диска или прямо из app.asar."""
+    if path.suffix == ".asar":
+        for rel in ("dist/main.js", "out/main.js"):
+            raw = asar_read_entry(path, rel)
+            if raw is not None:
+                return raw.decode("utf-8", errors="replace")
+        return None
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError:
+        return None
+
+
+def _is_desktop_target(path: Path) -> bool:
+    """Desktop-шелл (dist/main.js, app.asar), а не IDE out/main.js.
+    Проверку новой архитектуры применяем только здесь: у IDE main.js
+    модульный каркас и без auth-кода — ложное «new-arch» недопустим."""
+    return path.suffix == ".asar" or path.parent.name == "dist"
+
+
+def scan_ide(path: Path):
+    if not path.exists() and path.suffix != ".asar":
         return ("not-found", {}, {})
+    text = _ide_text_for(path)
+    if text is None:
+        return ("not-found", {}, {})
+    if _is_desktop_target(path) and is_new_desktop_architecture(text):
+        return ("new-arch", {"ide": ("new-arch", None)}, {})
     o = list(IDE_STOCK_RE.finditer(text))
     p = list(IDE_PATCHED_RE.finditer(text))
     if o and p:
@@ -1300,6 +1577,12 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
     except OSError as e:
         return f"read-error: {e}"
     resolved = resolve_manager_gates(data, ranges, arch)
+    # «каша» в байтовых гейтах (и orig, и patched / неизвестный скелет) —
+    # отказываемся целиком, как и раньше; rename поверх такого не пишем
+    bad = [k for k, v in resolved.items()
+           if str(v[0]).startswith(("ambiguous", "unknown"))]
+    if bad:
+        return f"pattern-not-found:ambiguous:{'+'.join(bad)}"
     jobs = []
     arm_fixes = None
     if "auth" in resolved and resolved["auth"][0] == "unpatched":
@@ -1313,7 +1596,8 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
     if "elig" in resolved and resolved["elig"][0] == "unpatched":
         off = resolved["elig"][1]
         jobs += [(off, [(d, b)], f"eligibility ({resolved['elig'][2]})") for d, b in _fixes_for("mgr_x64_elig")]
-    if not jobs:
+    rename_needed = rename_state(data)[0] in ("unpatched", "partial")
+    if not jobs and not rename_needed:
         if if_needed:
             return "already-patched"
         return "pattern-not-found:no-unpatched-gates"
@@ -1328,6 +1612,8 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
             ba = bytearray(new)
             ba[off + delta: off + delta + len(blob)] = blob
             new = bytes(ba)
+    if rename_needed:
+        new, _cnt = _apply_rename(new)
     werr = _mac_write(target_path, new)
     if werr:
         return werr
@@ -1347,31 +1633,56 @@ def do_patch_cli(target_path: Path) -> str:
     cands = [CLI_X64_V2, CLI_X64_V1, CLI_ARM64] if arch in (None, "x64") else [CLI_ARM64]
     if arch == "arm64":
         cands = [CLI_ARM64]
+    chosen = None
+    last = "no-gate-matched"
     for g in cands:
         if g.arch is not None and arch is not None and g.arch != arch:
             continue
         try:
-            s, off = g.state(data, ranges)
+            st, off = g.state(data, ranges)
         except (SigError, SigAmbiguous) as e:
             last = str(e)
             continue
-        if s == "patched":
-            return "already-patched"
-        if _locked_win(target_path):
-            return "locked: close Antigravity CLI first (file is busy), then retry"
-        err = _ensure_backup(target_path)
-        if err:
-            return err
-        new = _apply_fixes(data, off, g.fixes)
-        werr = _mac_write(target_path, new)
-        if werr:
-            return werr
-        st2 = scan_cli(target_path)[0]
-        if st2 != "patched":
-            return f"verify-failed:{st2}"
-        _mac_finalize(target_path)
-        return "patched"
-    return f"pattern-not-found:{locals().get('last', 'no-gate-matched')}"
+        chosen = (g, st, off)
+        break
+    rename_needed = rename_state(data)[0] in ("unpatched", "partial")
+    if chosen is None:
+        if rename_needed:
+            # rename-гейт самодостаточен (confeden): если байтовых гейтов в
+            # этой сборке нет, переименование поля снимает блокировку одно.
+            if _locked_win(target_path):
+                return "locked: close Antigravity CLI first (file is busy), then retry"
+            err = _ensure_backup(target_path)
+            if err:
+                return err
+            new, _cnt = _apply_rename(data)
+            werr = _mac_write(target_path, new)
+            if werr:
+                return werr
+            if scan_cli(target_path)[0] != "patched":
+                return "verify-failed"
+            _mac_finalize(target_path)
+            return "patched (rename)"
+        return f"pattern-not-found:{last}"
+    g, st, off = chosen
+    if st == "patched" and not rename_needed:
+        return "already-patched"
+    if _locked_win(target_path):
+        return "locked: close Antigravity CLI first (file is busy), then retry"
+    err = _ensure_backup(target_path)
+    if err:
+        return err
+    new = _apply_fixes(data, off, g.fixes)
+    if rename_needed:
+        new, _cnt = _apply_rename(new)
+    werr = _mac_write(target_path, new)
+    if werr:
+        return werr
+    st2 = scan_cli(target_path)[0]
+    if st2 != "patched":
+        return f"verify-failed:{st2}"
+    _mac_finalize(target_path)
+    return "patched"
 
 
 def _ide_cache_dirs():
@@ -1391,10 +1702,37 @@ def _ide_cache_dirs():
 
 
 def do_patch_ide(target_path: Path) -> str:
+    if target_path.suffix == ".asar":
+        # Desktop в app.asar: читаем dist/main.js прямо из архива. Новая
+        # архитектура — JS-патч не нужен, бинарь уже патчится отдельно.
+        # Старая — распаковываем (Electron предпочтёт каталог) и патчим.
+        text = _ide_text_for(target_path)
+        if text is None:
+            return "pattern-not-found:asar-mainjs-missing"
+        if is_new_desktop_architecture(text):
+            return ("new-arch: auth в language_server — JS-патч не нужен, "
+                    "запусти unlock manager/cli")
+        app_dir = target_path.parent / "app"
+        if app_dir.is_dir():
+            for rel in ("out/main.js", "dist/main.js"):
+                p = app_dir / rel
+                if p.is_file():
+                    return do_patch_ide(p)
+        err = asar_extract(target_path, app_dir)
+        if err:
+            return err
+        for rel in ("out/main.js", "dist/main.js"):
+            p = app_dir / rel
+            if p.is_file():
+                return do_patch_ide(p)
+        return "pattern-not-found:asar-extract-no-mainjs"
     try:
         text = target_path.read_text(encoding="utf-8")
     except OSError as e:
         return f"read-error: {e}"
+    if _is_desktop_target(target_path) and is_new_desktop_architecture(text):
+        return ("new-arch: auth в language_server — JS-патч не нужен, "
+                "запусти unlock manager/cli")
     o = list(IDE_STOCK_RE.finditer(text))
     p = list(IDE_PATCHED_RE.finditer(text))
     if p and not o:
@@ -1425,6 +1763,8 @@ def do_patch_ide(target_path: Path) -> str:
 
 
 def do_restore(target_path: Path) -> str:
+    if target_path.suffix == ".asar":
+        return asar_restore(target_path)
     bp = backup_path_for(target_path)
     if not bp.exists():
         if sys.platform.startswith("win"):
@@ -1457,23 +1797,28 @@ def human_size(n: int) -> str:
 
 
 def _detect_kind(p: Path) -> str:
-    """Определяет тип цели по содержимому, а не по имени (копии/кастомные пути)."""
+    """Определяет тип цели по содержимому, а не по имени (копии/кастомные пути).
+
+    rename-гейт есть в любом Go-бинаре проекта, поэтому тип решают только
+    байтовые гейты; один rename тип не назначает — иначе agy попадает в manager."""
     n = p.name.lower()
     if n.endswith(".js"):
         return "ide"
+    if n.endswith(".asar"):
+        return "ide"
     try:
-        st, _, _ = scan_manager(p)
+        st, res, _ = scan_manager(p)
     except (OSError, ValueError):
-        st = "unknown"
-    if st not in ("unknown", "not-found") and not st.startswith(("ambiguous", "pattern")):
+        st, res = "unknown", {}
+    if st not in ("unknown", "not-found") and any(k in res for k in ("auth", "elig")):
         return "manager"
     try:
-        stc, _, _ = scan_cli(p)
+        stc, resc, _ = scan_cli(p)
     except (OSError, ValueError):
-        stc = "unknown"
-    if stc not in ("unknown", "not-found"):
+        stc, resc = "unknown", {}
+    if stc not in ("unknown", "not-found") and "cli" in resc:
         return "cli"
-    # эвристика по имени как fallback
+    # эвристика по имени как fallback (rename-only сборки тоже сюда)
     if "language_server" in n:
         return "manager"
     if "main.js" in n:
@@ -1847,17 +2192,13 @@ def _clear():
 
 def _read_asar_version(asar: Path):
     """Версия из package.json внутри app.asar (рядом с language_server)."""
+    import json as _json
+    raw = asar_read_entry(asar, "package.json")
+    if raw is None:
+        return None
     try:
-        import json as _json
-        with asar.open("rb") as f:
-            _u1, header_size, _u2, json_size = struct.unpack("<IIII", f.read(16))
-            header = _json.loads(f.read(json_size).decode("utf-8"))
-            pkg = header.get("files", {}).get("package.json")
-            if not pkg or "offset" not in pkg or "size" not in pkg:
-                return None
-            f.seek(8 + header_size + int(pkg["offset"]))
-            return _json.loads(f.read(int(pkg["size"])).decode("utf-8")).get("version")
-    except (OSError, ValueError, KeyError):
+        return _json.loads(raw.decode("utf-8")).get("version")
+    except (ValueError, UnicodeError):
         return None
 
 
