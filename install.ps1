@@ -50,7 +50,34 @@ Write-Host "Wrapper:   $destCmd"
 if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
   throw 'Python 3.8+ not found in PATH - install from https://www.python.org/downloads/ (tick "Add to PATH"), then re-run.'
 }
+
+# Запущенный Antigravity держит language_server.exe и иногда app.asar.
+# Ждём закрытия, иначе патч молча пропустит занятые файлы.
+function Wait-AntigravityClosed([int]$TimeoutSec = 120) {
+  $names = @('Antigravity', 'language_server')
+  if (-not (Get-Process -Name $names -ErrorAction SilentlyContinue)) { return $true }
+  Write-Host ""
+  Write-Host "Antigravity is running - close it so the patcher can write its files."
+  for ($i = 1; $i -le $TimeoutSec; $i++) {
+    Start-Sleep -Seconds 1
+    if (-not (Get-Process -Name $names -ErrorAction SilentlyContinue)) {
+      Write-Host "Antigravity closed."
+      return $true
+    }
+    if ($i % 15 -eq 0) {
+      Write-Host "  still running ($($TimeoutSec - $i)s left)..."
+    }
+  }
+  return $false
+}
+
+$closed = Wait-AntigravityClosed
 try { & python $destPy unlock all } catch {}
+if (-not $closed) {
+  Write-Host ""
+  Write-Host "Antigravity was still running, so locked files were skipped." -ForegroundColor Yellow
+  Write-Host "Close it and run: python `"$destPy`" unlock all" -ForegroundColor Yellow
+}
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  agy-unlock-analog status           # check state"

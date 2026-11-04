@@ -74,7 +74,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.2.0-analog"
+VERSION = "2.2.1-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -164,8 +164,12 @@ MGR_X64_AUTH = Gate(
     arch="x64",
 )
 
-# -- manager x64 eligibility (xbox_dns/175, language_server 2.21.1) --
+# -- manager x64 eligibility (xbox_dns/175, language_server 2.21.1+) --
 # None = wildcard байт. Фиксов два, применяются атомарно.
+# Две раскладки одного и того же кода:
+#   v1 — 2.21: jg +0x0d перепрыгивает 4 выравнивающих NOP, хвост `eb 04 ... 90`;
+#   v2 — 2.29: компилятор сжал выравнивание (jg +0x09, `eb 03`, без NOP).
+# Смещения фиксов разные, поэтому раскладка определяется до применения.
 ELIG_ORIG = [
     0x7F, 0x0D, 0x0F, 0x1F, 0x40, 0x00, 0x48, 0x85, 0xC0,
     0x0F, 0x85, None, None, None, None,
@@ -174,67 +178,85 @@ ELIG_ORIG = [
     0xEB, 0x04, 0x45, 0x31, 0xD2, 0x90, 0x4D, 0x85, 0xD2,
     0x75, None,
 ]
-ELIG_OFF1, ELIG_LEN1 = 9, 6
-ELIG_OFF2 = 41
+ELIG_ORIG_V2 = [
+    0x7F, 0x09, 0x48, 0x85, 0xC0,
+    0x0F, 0x85, None, None, None, None,
+    0x4C, 0x8B, 0x94, 0x24, 0x98, 0x00, 0x00, 0x00,
+    0x4D, 0x85, 0xD2, 0x74, 0x06, 0x4D, 0x8B, 0x52, 0x08,
+    0xEB, 0x03, 0x45, 0x31, 0xD2, 0x4D, 0x85, 0xD2,
+    0x75, None,
+]
+ELIG_LEN1 = 6
 ELIG_FIX1 = bytes([0x90] * 6)
 ELIG_FIX2 = 0xEB
 ELIG_ORIG_OP2 = 0x75
+ELIG_LAYOUTS = (
+    {"name": "v1", "orig": ELIG_ORIG, "off1": 9, "off2": 41},
+    {"name": "v2", "orig": ELIG_ORIG_V2, "off1": 5, "off2": 36},
+)
 
 
-def _elig_find(data: bytes, ranges):
-    """Ищет префикс 7F 0D 0F 1F 40 00 48 85 C0 только в кодовых секциях,
-    возвращает (kind, offset). kind: patched|unpatched. Бросает SigError."""
-    needle = bytes([0x7F, 0x0D, 0x0F, 0x1F, 0x40, 0x00, 0x48, 0x85, 0xC0])
-    cands = []
+def elig_gate_start(data: bytes, anchor: int):
+    """Начало гейта по якорю `48 85 C0` (anchor). None — неизвестная раскладка."""
+    if anchor >= 2 and data[anchor - 2:anchor] == b"\x7f\x09":
+        return anchor - 2
+    if (anchor >= 6
+            and data[anchor - 6:anchor] == b"\x7f\x0d\x0f\x1f\x40\x00"):
+        return anchor - 6
+    return None
+
+
+def _elig_candidates(data: bytes, ranges, layout):
+    """Кандидаты одной раскладки: префикс до первого wildcard + полная маска."""
+    orig = layout["orig"]
+    off1, off2 = layout["off1"], layout["off2"]
+    wild = set(range(off1, off1 + ELIG_LEN1)) | {off2, off2 + 1}
+    needle = bytes(orig[:off1])
+    out = []
     for rs, re_ in _as_ranges(ranges):
         pos = data.find(needle, rs, re_)
         while pos != -1:
-            cands.append(pos)
-            if len(cands) > 16:
-                break
+            if pos + len(orig) <= len(data):
+                ok = True
+                for j, pb in enumerate(orig):
+                    if j in wild or pb is None:
+                        continue
+                    if data[pos + j] != pb:
+                        ok = False
+                        break
+                if ok:
+                    out.append(pos)
             pos = data.find(needle, pos + 1, re_)
-    if not cands:
+    return out
+
+
+def _elig_find(data: bytes, ranges):
+    """Ищет гейт eligibility в кодовых секциях. Возвращает
+    (kind, offset, layout). kind: patched|unpatched. Бросает SigError."""
+    found = []
+    for layout in ELIG_LAYOUTS:
+        found += [(c, layout) for c in _elig_candidates(data, ranges, layout)]
+    if not found:
         raise SigError("eligibility screen: сигнатура не найдена (неподдерживаемая версия?)")
-    if len(cands) > 1:
-        # несколько префиксов — сверяем полную маску, должен остаться один
-        full = []
-        for c in cands:
-            if c + len(ELIG_ORIG) > len(data):
-                continue
-            ok = True
-            for j, pb in enumerate(ELIG_ORIG):
-                if j in (ELIG_OFF1, ELIG_OFF1 + 1, ELIG_OFF1 + 2, ELIG_OFF1 + 3,
-                         ELIG_OFF1 + 4, ELIG_OFF1 + 5, ELIG_OFF2, ELIG_OFF2 + 1):
-                    continue
-                if pb is None:
-                    continue
-                if data[c + j] != pb:
-                    ok = False
-                    break
-            if ok:
-                full.append(c)
-        if len(full) != 1:
-            raise SigAmbiguous(
-                f"eligibility screen: кандидатов {len(full)} — отказываюсь гадать")
-        cands = full
-    c = cands[0]
-    if c + len(ELIG_ORIG) > len(data):
-        raise SigError("eligibility screen: обрезок в конце файла")
-    for j, pb in enumerate(ELIG_ORIG):
-        if j in (ELIG_OFF1, ELIG_OFF1 + 1, ELIG_OFF1 + 2, ELIG_OFF1 + 3,
-                 ELIG_OFF1 + 4, ELIG_OFF1 + 5, ELIG_OFF2, ELIG_OFF2 + 1):
-            continue
-        if pb is None:
-            continue
-        if data[c + j] != pb:
-            raise SigError("eligibility screen: сигнатура не найдена (неподдерживаемая версия?)")
-    b1 = data[c + ELIG_OFF1: c + ELIG_OFF1 + ELIG_LEN1]
-    b2 = data[c + ELIG_OFF2]
+    if len(found) > 1:
+        raise SigAmbiguous(
+            f"eligibility screen: кандидатов {len(found)} — отказываюсь гадать")
+    c, layout = found[0]
+    off1, off2 = layout["off1"], layout["off2"]
+    b1 = data[c + off1: c + off1 + ELIG_LEN1]
+    b2 = data[c + off2]
     if b1 == ELIG_FIX1 and b2 == ELIG_FIX2:
-        return ("patched", c)
-    if b1[0] == 0x0F and b1[1] == 0x85 and b2 == ELIG_ORIG_OP2:
-        return ("unpatched", c)
+        return ("patched", c, layout["name"])
+    if b1[:2] == b"\x0f\x85" and b2 == ELIG_ORIG_OP2:
+        return ("unpatched", c, layout["name"])
     raise SigError("eligibility screen: неизвестное состояние джампов")
+
+
+def elig_layout(name: str):
+    for layout in ELIG_LAYOUTS:
+        if layout["name"] == name:
+            return layout
+    return ELIG_LAYOUTS[0]
 
 
 class EligGate:
@@ -243,9 +265,11 @@ class EligGate:
     def state(self, data, ranges):
         return _elig_find(data, ranges)
 
-    def apply(self, buf: bytearray, off: int):
-        buf[off + ELIG_OFF1: off + ELIG_OFF1 + ELIG_LEN1] = ELIG_FIX1
-        buf[off + ELIG_OFF2] = ELIG_FIX2
+    def apply(self, buf: bytearray, off: int, layout_name: str = "v1"):
+        layout = elig_layout(layout_name)
+        off1, off2 = layout["off1"], layout["off2"]
+        buf[off + off1: off + off1 + ELIG_LEN1] = ELIG_FIX1
+        buf[off + off2] = ELIG_FIX2
 
 
 ELIG_GATE = EligGate()
@@ -316,32 +340,58 @@ def is_new_desktop_architecture(text: str) -> bool:
 
 # -- asar (формат архива Electron; подход confeden/Antigravity) --
 
+def asar_read_entry_ex(asar: Path, rel_path: str) -> tuple[bytes | None, str | None]:
+    """Читает файл из app.asar без распаковки. rel_path — через '/'.
+
+    Возвращает (data, error). error: None | locked | missing | read-error:* |
+    bad-archive:* | entry-missing. Отличать locked от entry-missing важно:
+    при запущенном Antigravity архив бывает занят и «main.js не найден» врёт."""
+    import time
+    last = None
+    for attempt in range(3):
+        try:
+            import json as _json
+            with asar.open("rb") as f:
+                head = f.read(16)
+                if len(head) != 16:
+                    return None, "bad-archive: header too short"
+                _u1, header_size, _u2, json_size = struct.unpack("<IIII", head)
+                if json_size <= 0 or header_size <= 0:
+                    return None, "bad-archive: bad header"
+                tree = _json.loads(f.read(json_size).decode("utf-8"))
+                node = tree
+                for part in rel_path.split("/"):
+                    if not isinstance(node, dict):
+                        return None, "entry-missing"
+                    node = node.get("files", {}).get(part)
+                # каталоги полезной нагрузки не несут; unpacked лежат на диске рядом
+                if not isinstance(node, dict) or "files" in node or node.get("unpacked"):
+                    return None, "entry-missing"
+                if "offset" not in node or "size" not in node:
+                    return None, "entry-missing"
+                f.seek(8 + header_size + int(node["offset"]))
+                data = f.read(int(node["size"]))
+                if len(data) != int(node["size"]):
+                    return None, "bad-archive: truncated entry"
+                return data, None
+        except PermissionError:
+            last = "locked"
+        except FileNotFoundError:
+            last = "missing"
+        except OSError as e:
+            last = f"read-error: {e}"
+        except (ValueError, KeyError, UnicodeError) as e:
+            last = f"bad-archive: {e}"
+        if last == "locked" and attempt < 2:
+            time.sleep(0.25)
+            continue
+        return None, last
+    return None, last
+
+
 def asar_read_entry(asar: Path, rel_path: str) -> bytes | None:
     """Читает файл из app.asar без распаковки. rel_path — через '/'."""
-    try:
-        import json as _json
-        with asar.open("rb") as f:
-            head = f.read(16)
-            if len(head) != 16:
-                return None
-            _u1, header_size, _u2, json_size = struct.unpack("<IIII", head)
-            if json_size <= 0 or header_size <= 0:
-                return None
-            tree = _json.loads(f.read(json_size).decode("utf-8"))
-            node = tree
-            for part in rel_path.split("/"):
-                if not isinstance(node, dict):
-                    return None
-                node = node.get("files", {}).get(part)
-            # каталоги полезной нагрузки не несут; unpacked лежат на диске рядом
-            if not isinstance(node, dict) or "files" in node or node.get("unpacked"):
-                return None
-            if "offset" not in node or "size" not in node:
-                return None
-            f.seek(8 + header_size + int(node["offset"]))
-            return f.read(int(node["size"]))
-    except (OSError, ValueError, KeyError, UnicodeError):
-        return None
+    return asar_read_entry_ex(asar, rel_path)[0]
 
 
 def asar_extract(asar: Path, app_dir: Path) -> str | None:
@@ -688,11 +738,26 @@ def cmd_learn(sel: str, explicit: str | None, apply: bool, auto: bool):
         for gname, enum in jobs:
             cands = enum(data, ranges)
             if gname == "mgr_x64_elig":
-                # enum отдаёт якорь test rax,rax (+6 от старта гейта) — сдвигаем к старту,
-                # окно скоринга и применение фиксов идут от старта гейта
-                cands = [c - 6 for c in cands if c >= 6 and _in_ranges(c - 6, len(ELIG_ORIG), ranges)]
-            template, volatile, src = _effective_template(gname)
-            ranked = learn_rank(data, cands, template, volatile)
+                # enum отдаёт якорь test rax,rax — отступаем к началу гейта
+                # (6 байт в старой раскладке, 2 в сжатой 2.29)
+                cands = [s for s in (elig_gate_start(data, c) for c in cands)
+                         if s is not None and _in_ranges(s, len(ELIG_ORIG), ranges)]
+            if gname == "mgr_x64_elig":
+                # Свой шаблон под раскладку кандидата: локальный пак может быть
+                # от старой сборки и даёт 0% на сжатой 2.29.
+                ranked = []
+                for c in cands:
+                    lay = elig_layout("v2" if data[c:c + 2] == b"\x7f\x09" else "v1")
+                    tmpl = bytes(b if b is not None else 0 for b in lay["orig"])
+                    vol = {i for i, b in enumerate(lay["orig"]) if b is None}
+                    vol |= set(range(lay["off1"], lay["off1"] + ELIG_LEN1))
+                    vol |= {lay["off2"], lay["off2"] + 1}
+                    ranked.append((_score_window(data[c:c + len(tmpl)], tmpl, vol), c))
+                ranked.sort(reverse=True)
+                src = "builtin-layout"
+            else:
+                template, volatile, src = _effective_template(gname)
+                ranked = learn_rank(data, cands, template, volatile)
             print(f"    gate {gname} [{src}]: кандидатов {len(ranked)}")
             for score, off in ranked[:6]:
                 print(f"      {score:5.1%} @{hex(off)}: {_ctx_hex(data, off, 43)}")
@@ -799,7 +864,8 @@ def _resolve_by_template(data: bytes, ranges, gname: str, enum_fn):
         return None
     cands = enum_fn(data, ranges)
     if gname == "mgr_x64_elig":
-        cands = [c - 6 for c in cands if c >= 6 and _in_ranges(c - 6, len(tmpl), ranges)]
+        cands = [s for s in (elig_gate_start(data, c) for c in cands)
+                 if s is not None and _in_ranges(s, len(tmpl), ranges)]
     ranked = learn_rank(data, cands, tmpl, vol)
     if not ranked:
         return None
@@ -827,8 +893,10 @@ def _state_at_template(data: bytes, off: int, gname: str) -> str:
         if data[off:off + 6] == AUTH_FIX:
             return "patched"
     elif gname == "mgr_x64_elig":
-        if data[off + ELIG_OFF1:off + ELIG_OFF1 + ELIG_LEN1] == ELIG_FIX1 \
-                and data[off + ELIG_OFF2] == ELIG_FIX2:
+        layout = elig_layout("v2" if data[off:off + 2] == b"\x7f\x09" else "v1")
+        off1, off2 = layout["off1"], layout["off2"]
+        if data[off + off1:off + off1 + ELIG_LEN1] == ELIG_FIX1 \
+                and data[off + off2] == ELIG_FIX2:
             return "patched"
     tmpl, vol, _ = _effective_template(gname)
     if _skeleton_ok(data, off, tmpl, vol, GATE_COVER[gname]):
@@ -851,8 +919,8 @@ def resolve_manager_gates(data: bytes, ranges, arch):
                 off, via = r
                 out["auth"] = (_state_at_template(data, off, "mgr_x64_auth"), off, via)
         try:
-            st, off = ELIG_GATE.state(data, ranges)
-            out["elig"] = (st, off, "strict")
+            st, off, layout = ELIG_GATE.state(data, ranges)
+            out["elig"] = (st, off, "strict-" + layout)
         except SigAmbiguous as e:
             out["elig"] = (f"ambiguous:{e}", None, "strict")
         except SigError:
@@ -871,7 +939,14 @@ def resolve_manager_gates(data: bytes, ranges, arch):
 
 def _store_learned(gname: str, data: bytes, off: int) -> Path:
     """Сохраняет фактические байты одобренного гейта + расширенный volatile."""
-    base, base_vol = _pack_template_for_gate(gname)
+    if gname == "mgr_x64_elig":
+        lay = elig_layout("v2" if data[off:off + 2] == b"\x7f\x09" else "v1")
+        base = bytes(b if b is not None else 0 for b in lay["orig"])
+        base_vol = {i for i, b in enumerate(lay["orig"]) if b is None}
+        base_vol |= set(range(lay["off1"], lay["off1"] + ELIG_LEN1))
+        base_vol |= {lay["off2"], lay["off2"] + 1}
+    else:
+        base, base_vol = _pack_template_for_gate(gname)
     win = data[off:off + len(base)]
     extra = {i for i in range(len(base))
              if i not in base_vol and i < len(win) and win[i] != base[i]}
@@ -881,11 +956,12 @@ def _store_learned(gname: str, data: bytes, off: int) -> Path:
     return _save_local_templates(stored)
 
 
-def _fixes_for(gname: str):
+def _fixes_for(gname: str, via: str | None = None):
     if gname == "mgr_x64_auth":
         return MGR_X64_AUTH.fixes
     if gname == "mgr_x64_elig":
-        return [(ELIG_OFF1, ELIG_FIX1), (ELIG_OFF2, bytes([ELIG_FIX2]))]
+        layout = elig_layout((via or "v1").rsplit("-", 1)[-1])
+        return [(layout["off1"], ELIG_FIX1), (layout["off2"], bytes([ELIG_FIX2]))]
     raise KeyError(gname)
 
 
@@ -1362,18 +1438,81 @@ def scan_cli(path: Path):
     return ("unknown", {}, {})
 
 
+def _ide_text_for_ex(path: Path) -> tuple[str | None, str | None]:
+    """(текст, error) для IDE/desktop-цели. error: locked|entry-missing|read-error:*."""
+    if path.suffix == ".asar":
+        last = "entry-missing"
+        for rel in ("dist/main.js", "out/main.js"):
+            raw, err = asar_read_entry_ex(path, rel)
+            if raw is not None:
+                return raw.decode("utf-8", errors="replace"), None
+            if err == "locked":
+                return None, "locked"
+            if err:
+                last = err
+        return None, last
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except OSError as e:
+        return None, f"read-error: {e}"
+
+
 def _ide_text_for(path: Path) -> str | None:
     """Текст main.js для IDE/desktop-цели: с диска или прямо из app.asar."""
-    if path.suffix == ".asar":
-        for rel in ("dist/main.js", "out/main.js"):
-            raw = asar_read_entry(path, rel)
-            if raw is not None:
-                return raw.decode("utf-8", errors="replace")
+    return _ide_text_for_ex(path)[0]
+
+
+def _pe_product_version(path: Path):
+    """ProductVersion из PE-ресурсов без открытия файла на запись (работает и у занятого exe)."""
+    if os.name != "nt":
         return None
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
+        import ctypes
+        from ctypes import wintypes
+
+        class VS_FIXEDFILEINFO(ctypes.Structure):
+            _fields_ = [
+                ("dwSignature", wintypes.DWORD),
+                ("dwStrucVersion", wintypes.DWORD),
+                ("dwFileVersionMS", wintypes.DWORD),
+                ("dwFileVersionLS", wintypes.DWORD),
+                ("dwProductVersionMS", wintypes.DWORD),
+                ("dwProductVersionLS", wintypes.DWORD),
+                ("dwFileFlagsMask", wintypes.DWORD),
+                ("dwFileFlags", wintypes.DWORD),
+                ("dwFileOS", wintypes.DWORD),
+                ("dwFileType", wintypes.DWORD),
+                ("dwFileSubtype", wintypes.DWORD),
+                ("dwFileDateMS", wintypes.DWORD),
+                ("dwFileDateLS", wintypes.DWORD),
+            ]
+
+        ver = ctypes.WinDLL("version")
+        size = ver.GetFileVersionInfoSizeW(str(path), None)
+        if not size:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(str(path), 0, size, buf):
+            return None
+        ptr = ctypes.c_void_p()
+        ln = wintypes.UINT()
+        if not ver.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(ln)):
+            return None
+        info = ctypes.cast(ptr, ctypes.POINTER(VS_FIXEDFILEINFO)).contents
+        return (info.dwProductVersionMS >> 16, info.dwProductVersionMS & 0xFFFF,
+                info.dwProductVersionLS >> 16, info.dwProductVersionLS & 0xFFFF)
+    except (OSError, AttributeError, ValueError):
         return None
+
+
+def _desktop_is_new_arch(path: Path):
+    """Desktop >= 2.4 по версии Antigravity.exe (когда main.js из app.asar не читается)."""
+    for parent in list(path.parents)[:5]:
+        for exe in (parent / "Antigravity.exe", parent / "resources" / "bin" / "language_server.exe"):
+            v = _pe_product_version(exe)
+            if v and v[:2] >= (2, 4):
+                return True
+    return False
 
 
 def _is_desktop_target(path: Path) -> bool:
@@ -1386,8 +1525,10 @@ def _is_desktop_target(path: Path) -> bool:
 def scan_ide(path: Path):
     if not path.exists() and path.suffix != ".asar":
         return ("not-found", {}, {})
-    text = _ide_text_for(path)
+    text, err = _ide_text_for_ex(path)
     if text is None:
+        if path.suffix == ".asar" and _desktop_is_new_arch(path):
+            return ("new-arch", {"ide": ("new-arch", None)}, {})
         return ("not-found", {}, {})
     if _is_desktop_target(path) and is_new_desktop_architecture(text):
         return ("new-arch", {"ide": ("new-arch", None)}, {})
@@ -1595,7 +1736,8 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
             jobs += [(off, [(d, b)], f"hasValidAuth ({via})") for d, b in _fixes_for("mgr_x64_auth")]
     if "elig" in resolved and resolved["elig"][0] == "unpatched":
         off = resolved["elig"][1]
-        jobs += [(off, [(d, b)], f"eligibility ({resolved['elig'][2]})") for d, b in _fixes_for("mgr_x64_elig")]
+        jobs += [(off, [(d, b)], f"eligibility ({resolved['elig'][2]})")
+                 for d, b in _fixes_for("mgr_x64_elig", resolved["elig"][2])]
     rename_needed = rename_state(data)[0] in ("unpatched", "partial")
     if not jobs and not rename_needed:
         if if_needed:
@@ -1706,8 +1848,17 @@ def do_patch_ide(target_path: Path) -> str:
         # Desktop в app.asar: читаем dist/main.js прямо из архива. Новая
         # архитектура — JS-патч не нужен, бинарь уже патчится отдельно.
         # Старая — распаковываем (Electron предпочтёт каталог) и патчим.
-        text = _ide_text_for(target_path)
+        text, rerr = _ide_text_for_ex(target_path)
         if text is None:
+            if rerr == "locked":
+                return "locked: close Antigravity first (app.asar is busy), then retry"
+            if _desktop_is_new_arch(target_path):
+                # Архив не прочитан (нет dist/main.js или он занят), но версия
+                # >= 2.4: auth всё равно в language_server, JS-патч не нужен.
+                return ("new-arch: auth в language_server — JS-патч не нужен, "
+                        "запусти unlock manager/cli")
+            if rerr and rerr not in ("entry-missing", "missing"):
+                return f"read-error: {rerr}"
             return "pattern-not-found:asar-mainjs-missing"
         if is_new_desktop_architecture(text):
             return ("new-arch: auth в language_server — JS-патч не нужен, "
@@ -1906,12 +2057,14 @@ def cmd_unlock(sel: str, if_needed: bool, explicit: str | None):
         p = Path(explicit)
         kind = _detect_kind(p)
         if kind == "ide":
-            print(f"[*] ide: {p}\n    -> {do_patch_ide(p)}")
+            res = do_patch_ide(p)
         elif kind == "cli":
-            print(f"[*] cli: {p}\n    -> {do_patch_cli(p)}")
+            res = do_patch_cli(p)
         else:
-            print(f"[*] manager: {p}\n    -> {do_unlock(p, if_needed)}")
-        return 0
+            res = do_unlock(p, if_needed)
+        print(f"[*] {kind}: {p}\n    -> {res}")
+        return 0 if (res in ("patched", "already-patched")
+                     or res.startswith("new-arch")) else 1
     if not tmap:
         print(f"[!] цель не найдена: {sel} (попробуй --path PATH)")
         return 2
@@ -1925,7 +2078,7 @@ def cmd_unlock(sel: str, if_needed: bool, explicit: str | None):
         else:
             res = do_patch_ide(path)
         print(f"    -> {res}")
-        if res not in ("patched", "already-patched"):
+        if not (res in ("patched", "already-patched") or res.startswith("new-arch")):
             rc = 1
     return rc
 

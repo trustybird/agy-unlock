@@ -49,6 +49,23 @@ if errorlevel 1 (
   echo Need Python 3.8+ in PATH: https://www.python.org/downloads/ ^(tick "Add to PATH"^), then re-run.
   exit /b 1
 )
+
+REM Запущенный Antigravity держит language_server.exe и иногда app.asar.
+tasklist /FI "IMAGENAME eq Antigravity.exe" 2>nul | find /I "Antigravity.exe" >nul
+if errorlevel 1 goto runpatch
+echo.
+echo Antigravity is running - close it so the patcher can write its files.
+set /a WAIT=0
+:waitloop
+timeout /t 1 /nobreak >nul
+tasklist /FI "IMAGENAME eq Antigravity.exe" 2>nul | find /I "Antigravity.exe" >nul
+if errorlevel 1 goto runpatch
+set /a WAIT+=1
+if %WAIT% lss 120 goto waitloop
+echo Antigravity is still running; locked files will be skipped.
+echo Close it and run: python "%DESTPY%" unlock all
+
+:runpatch
 python "%DESTPY%" unlock all
 echo.
 echo Next steps:
