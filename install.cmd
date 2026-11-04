@@ -32,13 +32,8 @@ if exist "%LOCALPATCHER%" (
 echo @echo off> "%DESTCMD%"
 echo python "%%~dp0agy-unlock-analog.py" %%*>> "%DESTCMD%"
 
-set "UPATH="
-for /f "skip=2 tokens=2,*" %%A in ('reg query HKCU\Environment /v Path 2^>nul') do set "UPATH=%%B"
-echo !UPATH! | find /I "%DIR%" >nul
-if errorlevel 1 (
-  if defined UPATH (setx PATH "!UPATH!;%DIR%" >nul) else (setx PATH "%DIR%" >nul)
-  echo Added to PATH ^(restart the terminal to pick it up^).
-)
+REM setx обрезает PATH до 1024 знаков - пишем через PowerShell без лимита.
+powershell -NoProfile -Command "$d=$env:DIR; $p=[Environment]::GetEnvironmentVariable('Path','User'); if(-not $p){$p=''}; if(($p -split ';') -notcontains $d){[Environment]::SetEnvironmentVariable('Path', ($p+';'+$d), 'User'); 'Added to PATH (restart the terminal to pick it up).'}"
 
 echo.
 echo Installed: %DESTPY%
@@ -51,24 +46,29 @@ if errorlevel 1 (
 )
 
 REM Запущенный Antigravity держит language_server.exe и иногда app.asar.
+REM Окно закрывают, а бэкенд language_server остаётся висеть - глушим сами.
 tasklist /FI "IMAGENAME eq Antigravity.exe" 2>nul | find /I "Antigravity.exe" >nul
-if errorlevel 1 goto runpatch
-echo.
-echo Antigravity is running - close it so the patcher can write its files.
-set /a WAIT=0
-:waitloop
-timeout /t 1 /nobreak >nul
+if errorlevel 1 goto checkls
+echo Stopping Antigravity.exe so the patcher can write its files...
+taskkill /F /T /IM Antigravity.exe >nul 2>&1
+:checkls
+tasklist /FI "IMAGENAME eq language_server.exe" 2>nul | find /I "language_server.exe" >nul
+if errorlevel 1 goto killdone
+echo Stopping language_server.exe so the patcher can write its files...
+taskkill /F /T /IM language_server.exe >nul 2>&1
+ping -n 2 127.0.0.1 >nul
+:killdone
 tasklist /FI "IMAGENAME eq Antigravity.exe" 2>nul | find /I "Antigravity.exe" >nul
+if errorlevel 1 goto verifyls
+echo   WARN: Antigravity.exe still running; locked files will be skipped.
+:verifyls
+tasklist /FI "IMAGENAME eq language_server.exe" 2>nul | find /I "language_server.exe" >nul
 if errorlevel 1 goto runpatch
-set /a WAIT+=1
-if %WAIT% lss 120 goto waitloop
-echo Antigravity is still running; locked files will be skipped.
-echo Close it and run: python "%DESTPY%" unlock all
+echo   WARN: language_server.exe still running; locked files will be skipped.
 
 :runpatch
 python "%DESTPY%" unlock all
 echo.
 echo Next steps:
 echo   agy-unlock-analog status           - check state
-echo   agy-unlock-analog daemon install   - re-patch automatically after updates
 endlocal

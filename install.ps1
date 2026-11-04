@@ -52,33 +52,36 @@ if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
 }
 
 # Запущенный Antigravity держит language_server.exe и иногда app.asar.
-# Ждём закрытия, иначе патч молча пропустит занятые файлы.
-function Wait-AntigravityClosed([int]$TimeoutSec = 120) {
-  $names = @('Antigravity', 'language_server')
-  if (-not (Get-Process -Name $names -ErrorAction SilentlyContinue)) { return $true }
+# Окно закрывают, а бэкенд language_server остаётся висеть - глушим сами.
+function Stop-AntigravityProcesses {
+  $names = @('Antigravity', 'language_server*')
+  $procs = Get-Process -Name $names -ErrorAction SilentlyContinue
+  if (-not $procs) { return $true }
   Write-Host ""
-  Write-Host "Antigravity is running - close it so the patcher can write its files."
-  for ($i = 1; $i -le $TimeoutSec; $i++) {
-    Start-Sleep -Seconds 1
-    if (-not (Get-Process -Name $names -ErrorAction SilentlyContinue)) {
-      Write-Host "Antigravity closed."
-      return $true
-    }
-    if ($i % 15 -eq 0) {
-      Write-Host "  still running ($($TimeoutSec - $i)s left)..."
-    }
+  Write-Host "Antigravity/backend is still running - stopping it so the patcher can write its files:"
+  foreach ($p in $procs) {
+    Write-Host ("  {0} (PID {1})" -f $p.Name, $p.Id)
+  }
+  try { $procs | Stop-Process -Force -ErrorAction Stop } catch {}
+  Start-Sleep -Seconds 2
+  $left = Get-Process -Name $names -ErrorAction SilentlyContinue
+  if (-not $left) {
+    Write-Host "  stopped."
+    return $true
+  }
+  Write-Host "  could not stop (locked files will be skipped):" -ForegroundColor Yellow
+  foreach ($p in $left) {
+    Write-Host ("  {0} (PID {1})" -f $p.Name, $p.Id) -ForegroundColor Yellow
   }
   return $false
 }
 
-$closed = Wait-AntigravityClosed
+$stopped = Stop-AntigravityProcesses
 try { & python $destPy unlock all } catch {}
-if (-not $closed) {
+if (-not $stopped) {
   Write-Host ""
-  Write-Host "Antigravity was still running, so locked files were skipped." -ForegroundColor Yellow
   Write-Host "Close it and run: python `"$destPy`" unlock all" -ForegroundColor Yellow
 }
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "  agy-unlock-analog status           # check state"
-Write-Host "  agy-unlock-analog daemon install   # re-patch automatically after updates"
