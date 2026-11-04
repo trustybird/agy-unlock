@@ -1718,10 +1718,12 @@ def _mac_is_macho(path: Path) -> bool:
         return False
 
 
-def _mac_sign_one(path: Path, deep: bool = True) -> tuple[int, str]:
+def _mac_sign_one(path: Path, deep: bool = True,
+                  ent: bytes | None = None) -> tuple[int, str]:
     """Ad-hoc подпись с сохранением entitlements, флагов и hardened runtime."""
     import tempfile
-    ent = _mac_entitlements(path)
+    if ent is None:
+        ent = _mac_entitlements(path)
     tmp_name = None
     cmd = ["codesign", "--force", "--sign", "-"]
     preserve = "flags,runtime" if ent else "entitlements,flags,runtime"
@@ -1745,34 +1747,60 @@ def _mac_sign_one(path: Path, deep: bool = True) -> tuple[int, str]:
     return rc, out
 
 
+def _mac_entitlements_for(path: Path) -> bytes | None:
+    """Entitlements патченного файла, иначе — из его стокового бэкапа.
+    Прошлый патчер мог переподписать без entitlements, и в живом файле их
+    уже нет; в .agybak подпись ещё оригинальная."""
+    ent = _mac_entitlements(path)
+    if ent:
+        return ent
+    bp = backup_path_for(path)
+    try:
+        if bp.exists():
+            return _mac_entitlements(bp)
+    except OSError:
+        pass
+    return None
+
+
 def _mac_finalize(path: Path):
     """Переподпись после патча. None — ок, иначе текст ошибки.
 
     Модифицированный бинарь теряет подпись, и macOS убивает его SIGKILL.
-    Подписываем bundle целиком, сохраняя entitlements (JIT/unsigned memory
-    у Electron) и hardened runtime; --deep сам обходит вложенные Mach-O."""
+    Сначала подписываем bundle с сохранением entitlements (JIT/unsigned memory
+    у Electron) и hardened runtime; затем переподписываем сам патченный бинарь
+    его entitlements (из .agybak, если живые потеряны) и обновляем печать
+    bundle без --deep, чтобы не снести подписи вложенных helper'ов."""
     if sys.platform != "darwin":
         return None
     target = _mac_app_bundle(path) or path
     _mac_run(["xattr", "-dr", "com.apple.quarantine", str(target)])
     rc, out = _mac_sign_one(target)
-    if rc == 0 and _mac_signature_ok(target):
-        print(f"    [macos] re-signed {target.name}")
-        return None
-    # --deep иногда спотыкается на вложенных helper'ах: подписываем их
-    # по одному от самых глубоких, затем bundle ещё раз.
-    if target.is_dir():
-        nested = sorted((p for p in target.rglob("*") if p.is_file() and _mac_is_macho(p)),
-                        key=lambda p: len(p.parts), reverse=True)
-        for p in nested:
-            if p == target:
-                continue
-            _mac_sign_one(p)
+    if rc != 0 or not _mac_signature_ok(target):
+        # --deep иногда спотыкается на вложенных helper'ах: подписываем их
+        # по одному от самых глубоких, затем bundle без --deep.
+        if target.is_dir():
+            nested = sorted((p for p in target.rglob("*")
+                             if p.is_file() and _mac_is_macho(p)),
+                            key=lambda p: len(p.parts), reverse=True)
+            for p in nested:
+                if p != target:
+                    _mac_sign_one(p, deep=False, ent=_mac_entitlements_for(p))
+            rc, out = _mac_sign_one(target, deep=False)
+    if rc != 0:
+        return f"sign-error: {out[-500:]}"
+    if target != path and _mac_is_macho(path):
+        # bundle-подпись с --deep сняла entitlements с патченного бинаря
+        erc, eout = _mac_sign_one(path, deep=False, ent=_mac_entitlements_for(path))
+        if erc != 0:
+            return f"sign-error: {eout[-500:]}"
         rc, out = _mac_sign_one(target, deep=False)
-        if rc == 0 and _mac_signature_ok(target):
-            print(f"    [macos] re-signed {target.name} (nested)")
-            return None
-    return f"sign-error: {out[-500:]}"
+        if rc != 0:
+            return f"sign-error: {out[-500:]}"
+    if not _mac_signature_ok(target):
+        return "sign-error: verify failed"
+    print(f"    [macos] re-signed {target.name}")
+    return None
 
 
 def _already_patched(path: Path) -> str:
@@ -2211,10 +2239,15 @@ def cmd_sign(sel: str = "all", explicit: str | None = None):
         print(f"[!] цель не найдена: {sel}")
         return 2
     rc = 0
+    seen = set()
     for name, path in tmap.items():
         if not path.exists():
             continue
         target = _mac_app_bundle(path) or path
+        key = target.resolve()
+        if key in seen:
+            continue
+        seen.add(key)
         print(f"[*] {name}: {target}")
         err = _mac_finalize(path)
         print(f"    -> {'signed' if err is None else err}")
