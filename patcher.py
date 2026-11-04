@@ -74,7 +74,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.2.1-analog"
+VERSION = "2.2.2-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -719,7 +719,7 @@ def cmd_learn(sel: str, explicit: str | None, apply: bool, auto: bool):
             if apply or auto or _confirm("    применить замену этого вхождения на ',true'? [y/N] "):
                 res = do_patch_ide(path)
                 print(f"    -> {res}")
-                if res not in ("patched", "already-patched"):
+                if not patch_ok(res):
                     rc = 1
             continue
         # бинарные цели
@@ -1681,17 +1681,113 @@ def _mac_write(path: Path, data: bytes):
         return f"write-error: {e}"
 
 
+def _mac_run_out(cmd: list[str]) -> tuple[int, bytes, str]:
+    """Как _mac_run, но stdout отдельно (нужно для entitlements)."""
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=120)
+        return r.returncode, r.stdout or b"", (r.stderr or b"").decode(errors="replace")
+    except (OSError, ValueError) as e:
+        return 127, b"", str(e)
+
+
+def _mac_entitlements(path: Path) -> bytes | None:
+    """Текущие entitlements подписи (XML) или None."""
+    rc, out, err = _mac_run_out(
+        ["codesign", "-d", "--entitlements", ":-", str(path)])
+    for blob in (out, err.encode(errors="replace")):
+        start = blob.find(b"<?xml")
+        if rc == 0 and start != -1:
+            end = blob.rfind(b"</plist>")
+            if end != -1:
+                return blob[start:end + len(b"</plist>")]
+    return None
+
+
+def _mac_signature_ok(path: Path) -> bool:
+    rc, _ = _mac_run(["codesign", "--verify", "--deep", "--strict", str(path)])
+    return rc == 0
+
+
+def _mac_is_macho(path: Path) -> bool:
+    try:
+        with path.open("rb") as f:
+            return f.read(4) in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                                 b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+    except OSError:
+        return False
+
+
+def _mac_sign_one(path: Path, deep: bool = True) -> tuple[int, str]:
+    """Ad-hoc подпись с сохранением entitlements, флагов и hardened runtime."""
+    import tempfile
+    ent = _mac_entitlements(path)
+    tmp_name = None
+    cmd = ["codesign", "--force", "--sign", "-"]
+    preserve = "flags,runtime" if ent else "entitlements,flags,runtime"
+    cmd.append("--preserve-metadata=" + preserve)
+    if deep and path.is_dir():
+        cmd.insert(2, "--deep")
+    if ent:
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".plist") as tmp:
+                tmp.write(ent)
+                tmp_name = tmp.name
+            cmd += ["--entitlements", tmp_name]
+        except OSError:
+            pass
+    rc, out = _mac_run(cmd + [str(path)])
+    if tmp_name:
+        try:
+            Path(tmp_name).unlink()
+        except OSError:
+            pass
+    return rc, out
+
+
 def _mac_finalize(path: Path):
-    """Переподпись после патча: иначе macOS убьёт бинарь (SIGKILL/Gatekeeper)."""
+    """Переподпись после патча. None — ок, иначе текст ошибки.
+
+    Модифицированный бинарь теряет подпись, и macOS убивает его SIGKILL.
+    Подписываем bundle целиком, сохраняя entitlements (JIT/unsigned memory
+    у Electron) и hardened runtime; --deep сам обходит вложенные Mach-O."""
     if sys.platform != "darwin":
-        return
+        return None
     target = _mac_app_bundle(path) or path
     _mac_run(["xattr", "-dr", "com.apple.quarantine", str(target)])
-    rc, out = _mac_run(["codesign", "--force", "--deep", "--sign", "-", str(target)])
-    if rc == 0:
+    rc, out = _mac_sign_one(target)
+    if rc == 0 and _mac_signature_ok(target):
         print(f"    [macos] re-signed {target.name}")
-    else:
-        print(f"    [macos] codesign failed (app may not launch): {out[-300:]}")
+        return None
+    # --deep иногда спотыкается на вложенных helper'ах: подписываем их
+    # по одному от самых глубоких, затем bundle ещё раз.
+    if target.is_dir():
+        nested = sorted((p for p in target.rglob("*") if p.is_file() and _mac_is_macho(p)),
+                        key=lambda p: len(p.parts), reverse=True)
+        for p in nested:
+            if p == target:
+                continue
+            _mac_sign_one(p)
+        rc, out = _mac_sign_one(target, deep=False)
+        if rc == 0 and _mac_signature_ok(target):
+            print(f"    [macos] re-signed {target.name} (nested)")
+            return None
+    return f"sign-error: {out[-500:]}"
+
+
+def _already_patched(path: Path) -> str:
+    """Уже пропатчено; на macOS заодно чиним подпись, если она протухла."""
+    if sys.platform == "darwin":
+        err = _mac_finalize(path)
+        if err:
+            return f"already-patched:{err}"
+    return "already-patched"
+
+
+def patch_ok(res: str) -> bool:
+    """Успех патча/проверки, но не «пропатчено, а подпись сломана»."""
+    return (res.startswith(("patched", "already-patched", "new-arch"))
+            and "sign-error" not in res)
 
 
 def _apply_fixes(data: bytes, off: int, fixes) -> bytes:
@@ -1706,7 +1802,7 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
     if st == "not-found":
         return "not-found"
     if st == "patched":
-        return "already-patched"
+        return _already_patched(target_path)
     if st.startswith(("ambiguous", "unknown")):
         return f"pattern-not-found:{st}"
     # partial или unpatched — патчим все unpatched-гейты
@@ -1741,7 +1837,7 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
     rename_needed = rename_state(data)[0] in ("unpatched", "partial")
     if not jobs and not rename_needed:
         if if_needed:
-            return "already-patched"
+            return _already_patched(target_path)
         return "pattern-not-found:no-unpatched-gates"
     if _locked_win(target_path):
         return "locked: close Antigravity first (file is busy), then retry"
@@ -1762,8 +1858,8 @@ def do_unlock(target_path: Path, if_needed: bool = False) -> str:
     st2, _, _ = scan_manager(target_path)
     if st2 != "patched":
         return f"verify-failed:{st2}"
-    _mac_finalize(target_path)
-    return "patched"
+    serr = _mac_finalize(target_path)
+    return "patched" if not serr else f"patched:{serr}"
 
 
 def do_patch_cli(target_path: Path) -> str:
@@ -1803,12 +1899,13 @@ def do_patch_cli(target_path: Path) -> str:
                 return werr
             if scan_cli(target_path)[0] != "patched":
                 return "verify-failed"
-            _mac_finalize(target_path)
-            return "patched (rename)"
+            serr = _mac_finalize(target_path)
+            return ("patched (rename)" if not serr
+                    else f"patched (rename):{serr}")
         return f"pattern-not-found:{last}"
     g, st, off = chosen
     if st == "patched" and not rename_needed:
-        return "already-patched"
+        return _already_patched(target_path)
     if _locked_win(target_path):
         return "locked: close Antigravity CLI first (file is busy), then retry"
     err = _ensure_backup(target_path)
@@ -1823,8 +1920,8 @@ def do_patch_cli(target_path: Path) -> str:
     st2 = scan_cli(target_path)[0]
     if st2 != "patched":
         return f"verify-failed:{st2}"
-    _mac_finalize(target_path)
-    return "patched"
+    serr = _mac_finalize(target_path)
+    return "patched" if not serr else f"patched:{serr}"
 
 
 def _ide_cache_dirs():
@@ -1887,7 +1984,7 @@ def do_patch_ide(target_path: Path) -> str:
     o = list(IDE_STOCK_RE.finditer(text))
     p = list(IDE_PATCHED_RE.finditer(text))
     if p and not o:
-        return "already-patched"
+        return _already_patched(target_path)
     if not o:
         return "pattern-not-found:ide-gate-missing"
     if len(o) != 1:
@@ -1909,8 +2006,8 @@ def do_patch_ide(target_path: Path) -> str:
             pass
     if scan_ide(target_path)[0] != "patched":
         return "verify-failed"
-    _mac_finalize(target_path)
-    return "patched"
+    serr = _mac_finalize(target_path)
+    return "patched" if not serr else f"patched:{serr}"
 
 
 def do_restore(target_path: Path) -> str:
@@ -2063,8 +2160,7 @@ def cmd_unlock(sel: str, if_needed: bool, explicit: str | None):
         else:
             res = do_unlock(p, if_needed)
         print(f"[*] {kind}: {p}\n    -> {res}")
-        return 0 if (res in ("patched", "already-patched")
-                     or res.startswith("new-arch")) else 1
+        return 0 if patch_ok(res) else 1
     if not tmap:
         print(f"[!] цель не найдена: {sel} (попробуй --path PATH)")
         return 2
@@ -2078,7 +2174,7 @@ def cmd_unlock(sel: str, if_needed: bool, explicit: str | None):
         else:
             res = do_patch_ide(path)
         print(f"    -> {res}")
-        if not (res in ("patched", "already-patched") or res.startswith("new-arch")):
+        if not patch_ok(res):
             rc = 1
     return rc
 
@@ -2097,6 +2193,32 @@ def cmd_restore(sel: str, explicit: str | None):
         res = do_restore(path)
         print(f"    -> {res}")
         if not res.startswith(("restored", "restored-from-alt")):
+            rc = 1
+    return rc
+
+
+def cmd_sign(sel: str = "all", explicit: str | None = None):
+    """macOS: переподписать уже пропатченные цели (лечит SIGKILL при старте)."""
+    if sys.platform != "darwin":
+        print("[!] sign: только macOS")
+        return 0
+    if explicit:
+        p = Path(explicit)
+        tmap = {_detect_kind(p): p}
+    else:
+        tmap = resolve_targets(sel, None)
+    if not tmap:
+        print(f"[!] цель не найдена: {sel}")
+        return 2
+    rc = 0
+    for name, path in tmap.items():
+        if not path.exists():
+            continue
+        target = _mac_app_bundle(path) or path
+        print(f"[*] {name}: {target}")
+        err = _mac_finalize(path)
+        print(f"    -> {'signed' if err is None else err}")
+        if err:
             rc = 1
     return rc
 
@@ -2599,6 +2721,9 @@ def main(argv=None):
     p_r = sub.add_parser("restore", help="откатить")
     p_r.add_argument("target", nargs="?", default="all", choices=["app", "manager", "cli", "ide", "all"])
     p_r.add_argument("--path", default=None)
+    p_sg = sub.add_parser("sign", help="macOS: переподписать после патча (лечит SIGKILL)")
+    p_sg.add_argument("target", nargs="?", default="all", choices=["app", "manager", "cli", "ide", "all"])
+    p_sg.add_argument("--path", default=None)
     p_d = sub.add_parser("daemon", help="фоновый автопатч")
     p_d.add_argument("op", nargs="?", default="status", choices=["install", "uninstall", "status", "run", "refresh"])
     p_d.add_argument("--poll", type=float, default=5.0)
@@ -2624,6 +2749,8 @@ def main(argv=None):
         return cmd_unlock(args.target, args.if_needed, args.path)
     if args.cmd == "restore":
         return cmd_restore(args.target, args.path)
+    if args.cmd == "sign":
+        return cmd_sign(args.target, args.path)
     if args.cmd == "daemon":
         if args.op == "install":
             return daemon_install()

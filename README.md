@@ -70,9 +70,24 @@ curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.
 - Нужен Python 3.8+ (в системе его нет — ставь с python.org).
 - Запись в `/Applications` требует прав: закрой Antigravity и при
   отказе запускай с `sudo` (скрипт сам подскажет).
-- После патча бинарь переподписывается автоматически (`codesign -s -`,
-  снимается карантин) — иначе macOS не даст приложению запуститься.
+- После патча bundle переподписывается ad-hoc с сохранением entitlements,
+  hardened runtime и флагов; подпись проверяется (`codesign --verify`).
+  Если проверка не прошла — патч считается неуспешным, а не «готово».
 - Apple Silicon и Intel поддерживаются (сигнатуры под каждую архитектуру).
+
+### Если уже словил SIGKILL
+
+`Startup failed — Language server exited unexpectedly (signal=SIGKILL)`
+значит, что бинарь пропатчен, но подпись недействительна. Починить можно
+без повторного патча (закрой Antigravity):
+
+```sh
+sudo xattr -dr com.apple.quarantine /Applications/Antigravity.app
+sudo codesign --force --deep --sign - --preserve-metadata=entitlements,flags,runtime /Applications/Antigravity.app
+sudo codesign --verify --deep --strict /Applications/Antigravity.app
+```
+
+Или командой патчера: `agy-unlock-analog sign` (после `sudo`).
 
 ## Готовый exe (без Python)
 

@@ -62,7 +62,7 @@ case ":$PATH:" in
   *) printf 'Add to PATH:  export PATH="%s:$PATH"\n' "$bindir" ;;
 esac
 
-"$dest" unlock all || true
+"$dest" unlock all || printf '\npatch reported errors; close the app and retry (macOS: with sudo)\n'
 
 printf '\nNext steps:\n'
 printf '  agy-unlock-analog status           # check state\n'
