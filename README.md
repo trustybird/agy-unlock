@@ -70,24 +70,49 @@ curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.
 - Нужен Python 3.8+ (в системе его нет — ставь с python.org).
 - Запись в `/Applications` требует прав: закрой Antigravity и при
   отказе запускай с `sudo` (скрипт сам подскажет).
-- После патча bundle переподписывается ad-hoc с сохранением entitlements,
-  hardened runtime и флагов; подпись проверяется (`codesign --verify`).
-  Если проверка не прошла — патч считается неуспешным, а не «готово».
+- После патча переподписывается весь код в bundle ad-hoc — каждый вложенный
+  элемент отдельно (framework'и, helper'ы, бинари; от самых глубоких),
+  с сохранением entitlements, hardened runtime и флагов — затем сам bundle.
+  `codesign --deep` не используется: он пропускает ещё валидно подписанный
+  родной (Google) код, остаётся смесь Team ID, и library validation убивает
+  приложение при запуске. Подпись проверяется (`codesign --verify`);
+  если проверка не прошла — патч считается неуспешным, а не «готово».
 - Apple Silicon и Intel поддерживаются (сигнатуры под каждую архитектуру).
 
-### Если уже словил SIGKILL
+### Если словил SIGKILL или «different Team IDs»
 
-`Startup failed — Language server exited unexpectedly (signal=SIGKILL)`
-значит, что бинарь пропатчен, но подпись недействительна. Починить можно
-без повторного патча (закрой Antigravity):
+Два симптома битой подписи:
+
+- `Language server exited unexpectedly (signal=SIGKILL)` — пропатченный
+  бинарь остался с недействительной подписью;
+- краш приложения сразу при запуске (`EXC_CRASH (SIGABRT)`, в отчёте
+  DYLD: `... (non-platform) have different Team IDs`) — главный exe уже
+  ad-hoc, а часть вложенного кода (Electron Framework и т.п.) осталась
+  с родной подписью; library validation не даёт грузить чужой Team ID.
+
+Починка без повторного патча (закрой Antigravity), основной способ:
+
+```sh
+agy-unlock-analog sign
+```
+
+Если патчера рядом нет, вручную (после `sudo`):
 
 ```sh
 sudo xattr -dr com.apple.quarantine /Applications/Antigravity.app
-sudo codesign --force --deep --sign - --preserve-metadata=entitlements,flags,runtime /Applications/Antigravity.app
+cd /Applications/Antigravity.app
+sudo find Contents -depth \( -name '*.framework' -o -name '*.app' \
+  -o -name '*.xpc' -o -name '*.appex' -o -name '*.bundle' \) \
+  -exec codesign --force --sign - {} +
+sudo find Contents -type f \( -name '*.dylib' -o -name '*.node' \) \
+  -exec codesign --force --sign - {} +
+sudo codesign --force --sign - Contents/Resources/bin/language_server
+sudo codesign --force --sign - /Applications/Antigravity.app
 sudo codesign --verify --deep --strict /Applications/Antigravity.app
 ```
 
-Или командой патчера: `agy-unlock-analog sign` (после `sudo`).
+Важно: `codesign --force --deep --sign -` здесь не поможет — он не
+трогает ещё валидно подписанный вложенный код, и смесь Team ID остаётся.
 
 ## Готовый exe (без Python)
 

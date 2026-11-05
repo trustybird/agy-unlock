@@ -74,7 +74,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.2.2-analog"
+VERSION = "2.2.3-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -1763,34 +1763,75 @@ def _mac_entitlements_for(path: Path) -> bytes | None:
     return None
 
 
+MAC_BUNDLE_PAT = ("*.framework", "*.app", "*.xpc", "*.appex", "*.bundle", "*.kext")
+
+
+def _mac_nested_code(root: Path):
+    """Вложенный код для переподписи: бандлы (.framework/.app/...) и отдельные
+    Mach-O файлы (dylib, node, пропатченные бинари), самые глубокие — первыми.
+    .agybak исключён: это бэкап оригинала, его содержимое менять нельзя.
+    --deep не годится: он пропускает ещё валидно подписанный (Google) вложенный
+    код, и остаётся смесь Team ID — главный exe adhoc + фреймворк от Google.
+    Library validation убивает такой процесс при запуске (SIGABRT, DYLD
+    'different Team IDs'), поэтому подписываем всё явно, от самых глубоких,
+    и только затем сам бандл."""
+    out, seen = [], set()
+
+    def add(p: Path):
+        if p.name.endswith(".agybak"):
+            return
+        try:
+            rp = p.resolve()
+        except OSError:
+            return
+        if rp not in seen:
+            seen.add(rp)
+            out.append(p)
+
+    for pat in MAC_BUNDLE_PAT:
+        for p in root.rglob(pat):
+            add(p)
+    for p in root.rglob("*"):
+        if p.is_file() and _mac_is_macho(p):
+            add(p)
+    out.sort(key=lambda p: len(p.parts), reverse=True)
+    return out
+
+
 def _mac_finalize(path: Path):
     """Переподпись после патча. None — ок, иначе текст ошибки.
 
     Модифицированный бинарь теряет подпись, и macOS убивает его SIGKILL.
-    Сначала подписываем bundle с сохранением entitlements (JIT/unsigned memory
-    у Electron) и hardened runtime; затем переподписываем сам патченный бинарь
-    его entitlements (из .agybak, если живые потеряны) и обновляем печать
-    bundle без --deep, чтобы не снести подписи вложенных helper'ов."""
+    Бандл тоже нельзя оставлять наполовину родным: --deep пропускает ещё
+    валидные Google-подписи вложенного кода, главный exe при этом становится
+    adhoc, и library validation убивает приложение (SIGABRT, 'different Team
+    IDs'). Подписываем каждый вложенный элемент явно (preserve сохраняет
+    entitlements/flags/runtime каждого), затем сам бандл, затем патченный
+    бинарь его entitlements (из .agybak, если живые потеряны) и заново
+    печать бандла. Сломанные подписи чинятся командой `sign`."""
     if sys.platform != "darwin":
         return None
     target = _mac_app_bundle(path) or path
     _mac_run(["xattr", "-dr", "com.apple.quarantine", str(target)])
-    rc, out = _mac_sign_one(target)
-    if rc != 0 or not _mac_signature_ok(target):
-        # --deep иногда спотыкается на вложенных helper'ах: подписываем их
-        # по одному от самых глубоких, затем bundle без --deep.
-        if target.is_dir():
-            nested = sorted((p for p in target.rglob("*")
-                             if p.is_file() and _mac_is_macho(p)),
-                            key=lambda p: len(p.parts), reverse=True)
-            for p in nested:
-                if p != target:
-                    _mac_sign_one(p, deep=False, ent=_mac_entitlements_for(p))
-            rc, out = _mac_sign_one(target, deep=False)
+    if target.is_dir():
+        fails = 0
+        for p in _mac_nested_code(target):
+            if p.is_file():
+                _mac_ensure_writable(p)
+            rc2, _ = _mac_sign_one(p, deep=False)
+            if rc2 != 0:
+                fails += 1
+        if fails:
+            print(f"    [macos] {fails} вложенных элементов не переподписались "
+                  "(если это важно, verify ниже честно упадёт)")
+        rc, out = _mac_sign_one(target, deep=False)
+    else:
+        rc, out = _mac_sign_one(target, deep=False)
     if rc != 0:
         return f"sign-error: {out[-500:]}"
     if target != path and _mac_is_macho(path):
-        # bundle-подпись с --deep сняла entitlements с патченного бинаря
+        # патченный бинарь: его entitlements (из .agybak, если живые потеряны)
+        # и свежая печать бандла поверх
         erc, eout = _mac_sign_one(path, deep=False, ent=_mac_entitlements_for(path))
         if erc != 0:
             return f"sign-error: {eout[-500:]}"
@@ -1804,11 +1845,9 @@ def _mac_finalize(path: Path):
 
 
 def _already_patched(path: Path) -> str:
-    """Уже пропатчено; на macOS заодно чиним подпись, если она протухла."""
-    if sys.platform == "darwin":
-        err = _mac_finalize(path)
-        if err:
-            return f"already-patched:{err}"
+    """Уже пропатчено. Подпись здесь НЕ трогаем: полная переподпись бандла —
+      дорогая операция, и на фоне daemon-поллинга недопустимая; протухшую
+      или несогласованную подпись чинит отдельная команда `sign`."""
     return "already-patched"
 
 
