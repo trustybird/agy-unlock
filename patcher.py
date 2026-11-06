@@ -66,15 +66,17 @@ confeden/Antigravity (restricted license, идеи из README, без кода)
 from __future__ import annotations
 import argparse
 import hashlib
+import ipaddress
 import os
 import re
 import shutil
+import socket
 import struct
 import sys
 import time
 from pathlib import Path
 
-VERSION = "2.2.3-analog"
+VERSION = "2.2.4-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
@@ -2295,6 +2297,162 @@ def cmd_sign(sel: str = "all", explicit: str | None = None):
     return rc
 
 
+# -------------------------------------------------- doctor ---
+
+DOCTOR_DOMAINS = (
+    "aicode.googleapis.com",
+    "businessaicode.googleapis.com",
+    "cloudcode-pa.googleapis.com",
+    "oauth2.googleapis.com",
+    "accounts.google.com",
+)
+DOCTOR_AUTH_DOMAINS = frozenset({"oauth2.googleapis.com", "accounts.google.com"})
+# Публичные диапазоны фронтендов Google. Если домен резолвится сюда — geo-DNS
+# его не покрывает, и трафик уходит в Google напрямую с реальным регионом.
+_GOOGLE_V4_NETS = tuple(ipaddress.ip_network(n) for n in (
+    "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16", "216.58.192.0/19",
+    "74.125.0.0/16", "64.233.160.0/19", "209.85.128.0/17", "108.177.0.0/17",
+    "173.194.0.0/16",
+))
+
+
+def _ls_log_path() -> Path:
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support" / "Antigravity"
+    elif os.name == "nt":
+        base = Path(os.environ.get("APPDATA", "")) / "Antigravity"
+    else:
+        base = Path.home() / ".config" / "Antigravity"
+    return base / "logs" / "language_server.log"
+
+
+def _ip_kind(ip: str) -> str:
+    """'google' | 'custom' | 'other'. custom = вне публичных диапазонов
+    Google — так обычно выглядит IP geo-DNS/прокси."""
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return "other"
+    if a.version != 4 or any(a in n for n in _GOOGLE_V4_NETS):
+        return "google"
+    return "custom"
+
+
+def _scan_ls_log(text: str):
+    """(verdict, detail, count, last_ts) по тексту language_server.log.
+    verdict 'location-block' = сервер ответил LOCATION_NOT_ELIGIBLE."""
+    verdict = detail = last_ts = None
+    count = 0
+    m = re.search(r'detected_location\\?":\s*\\?"([A-Z]{2})', text)
+    if m:
+        verdict = "location-block"
+        detail = m.group(1)
+    for line in text.splitlines():
+        if "LOCATION_NOT_ELIGIBLE" in line or "PERMISSION_DENIED" in line and "403" in line:
+            count += 1
+            tm = re.search(r'([EWI])(\d{4}) (\d{2}:\d{2}:\d{2})', line)
+            if tm:
+                last_ts = f"{tm.group(2)} {tm.group(3)}"
+    return verdict, detail, count, last_ts
+
+
+def _read_log_tail(path: Path, limit: int = 512 * 1024) -> str | None:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > limit:
+                f.seek(size - limit)
+            return f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def cmd_doctor() -> int:
+    """Диагностика «пропатчено, но ineligible»: клиент, лог LS, DNS-покрытие."""
+    rc = 0
+    print(f"{TOOL_NAME} doctor  ({sys.platform})")
+
+    print("\n[1/3] клиент")
+    t = find_all_targets()
+    p = t.get("manager")
+    if p is None:
+        print("  manager: не найден (Antigravity установлен?)")
+        rc = 1
+    else:
+        st, res, _ = scan_manager(p)
+        gates = ", ".join(f"{k}={v[0]}" for k, v in sorted(res.items())) \
+            if isinstance(res, dict) else ""
+        print(f"  manager: {st}  {gates}")
+        print(f"  путь: {p}")
+        if st != "patched":
+            print("  [!] не пропатчен — сначала: agy-unlock-analog unlock all")
+            rc = 1
+
+    print("\n[2/3] лог language_server")
+    lp = _ls_log_path()
+    text = _read_log_tail(lp)
+    verdict, detail, count, last_ts = _scan_ls_log(text) if text else (None, None, 0, None)
+    if text is None:
+        print(f"  лог не найден: {lp} (запусти Antigravity и повтори)")
+    elif verdict == "location-block":
+        print(f"  [!] LOCATION_NOT_ELIGIBLE: сервер отказал по региону "
+              f"(detected: {detail}), повторов: {count}, последняя: {last_ts}")
+        print(f"      лог: {lp}")
+    elif count:
+        print(f"  ошибки доступа к API: {count} (последняя: {last_ts})")
+    else:
+        print("  ошибок региона/доступа в хвосте лога нет")
+
+    print("\n[3/3] DNS-покрытие geo-провайдера")
+    old_timeout = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(4.0)
+    resolved = []
+    for host in DOCTOR_DOMAINS:
+        ip = None
+        try:
+            ai = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+            if ai:
+                ip = ai[0][4][0]
+        except OSError:
+            pass
+        resolved.append((host, ip))
+    socket.setdefaulttimeout(old_timeout)
+    kind_of = {}
+    for host, ip in resolved:
+        kind = _ip_kind(ip) if ip else "fail"
+        kind_of[host] = kind
+        mark = {"google": "напрямую (geo-DNS не покрывает!)", "custom": "geo/прокси",
+                "other": "неопознанный IP", "fail": "не резолвится"}[kind]
+        warn = "  [!]" if kind in ("google", "fail") and host in DOCTOR_AUTH_DOMAINS else ""
+        print(f"  {host:35} -> {ip or '-':16} {mark}{warn}")
+
+    auth_direct = [h for h in DOCTOR_AUTH_DOMAINS if kind_of.get(h) in ("google", "fail")]
+    api_custom = any(kind_of.get(h) == "custom" for h in DOCTOR_DOMAINS
+                     if h not in DOCTOR_AUTH_DOMAINS)
+
+    print("\nИтог:")
+    if verdict == "location-block":
+        if auth_direct:
+            print("  [!] Geo-DNS покрывает API-домены, но домены входа "
+                  f"({', '.join(sorted(auth_direct))}) идут напрямую — Google видит "
+                  "реальный регион в токенах/входе и блокирует аккаунт.")
+            print("      Варианты: попросить провайдера geo-DNS покрыть эти домены, "
+                  "либо включить VPN на всю систему (или https_proxy для LS).")
+        elif api_custom:
+            print("  [!] Все домены покрыты geo-DNS, но сервер всё равно видит "
+                  f"регион {detail}: вероятно, Google определяет выходной IP "
+                  "прокси как запрещённый регион или смотрит на страну аккаунта.")
+            print("      Сообщи провайдеру geo-DNS (вердыкт: detected_location="
+                  f"{detail}); попробуй другой аккаунт или VPN с чистым IP.")
+        rc = 1
+    elif text is None:
+        print("  Лога нет — запусти Antigravity, воспроизведи проблему и повтори doctor.")
+    elif rc == 0:
+        print("  Проблем не видно: клиент пропатчен, в логе ошибок региона нет, "
+              "DNS настроен.")
+    return rc
+
+
 # -------------------------------------------------- daemon ---
 
 def daemon_dir() -> Path:
@@ -2809,6 +2967,7 @@ def main(argv=None):
     p_s.add_argument("--file", default=None)
     p_s.add_argument("--out", default=None)
     sub.add_parser("prune", help="снять демон")
+    sub.add_parser("doctor", help="диагностика: патч, ошибки в логе LS, DNS-покрытие geo")
     sub.add_parser("version", help="версия")
     args = ap.parse_args(argv)
     if args.cmd is None:
@@ -2844,6 +3003,8 @@ def main(argv=None):
     if args.cmd == "version":
         print(f"{TOOL_NAME} {VERSION}")
         return 0
+    if args.cmd == "doctor":
+        return cmd_doctor()
     ap.print_help()
     return 2
 
