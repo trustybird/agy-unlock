@@ -2305,8 +2305,11 @@ DOCTOR_DOMAINS = (
     "cloudcode-pa.googleapis.com",
     "oauth2.googleapis.com",
     "accounts.google.com",
+    "www.googleapis.com",
 )
-DOCTOR_AUTH_DOMAINS = frozenset({"oauth2.googleapis.com", "accounts.google.com"})
+DOCTOR_AUTH_DOMAINS = frozenset({
+    "oauth2.googleapis.com", "accounts.google.com", "www.googleapis.com",
+})
 # Публичные диапазоны фронтендов Google. Если домен резолвится сюда — geo-DNS
 # его не покрывает, и трафик уходит в Google напрямую с реальным регионом.
 _GOOGLE_V4_NETS = tuple(ipaddress.ip_network(n) for n in (
