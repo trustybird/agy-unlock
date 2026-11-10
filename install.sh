@@ -62,8 +62,31 @@ case ":$PATH:" in
   *) printf 'Add to PATH:  export PATH="%s:$PATH"\n' "$bindir" ;;
 esac
 
+# Запущенный бэкенд держит свой бинарь открытым и продолжает отдавать старый
+# код, пока приложение не перезапущено: патч записан, а «не срабатывает».
+# Windows-установщики такого процесса глушат; на POSIX это делаем здесь.
+stop_backend() {
+  command -v pkill >/dev/null 2>&1 || return 0
+  found=""
+  # /agy с границей слова — иначе шаблон зацепит посторонний процесс.
+  for pat in 'language_server' '/agy( |$)'; do
+    pids=$(pgrep -f "$pat" 2>/dev/null || true)
+    for p in $pids; do
+      [ "$p" = "$$" ] && continue
+      found="$found $p"
+      kill "$p" 2>/dev/null || true
+    done
+  done
+  if [ -n "$found" ]; then
+    printf 'Stopped running backend (PID%s) - restart Antigravity after patching.\n' "$found"
+    sleep 1
+  fi
+}
+stop_backend
+
 "$dest" unlock all || printf '\npatch reported errors; close the app and retry (macOS: with sudo)\n'
 
 printf '\nNext steps:\n'
 printf '  agy-unlock-analog status           # check state\n'
+printf '  agy-unlock-analog doctor           # diagnose "patched but ineligible"\n'
 printf '  agy-unlock-analog daemon install   # re-patch automatically after updates\n'

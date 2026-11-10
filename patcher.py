@@ -1221,10 +1221,17 @@ def _ls_glob_patterns(root: Path, os_name: str) -> list[str]:
             pats.append(str(root / "*ntigravity*" / rel / "language_server*"))
             pats.append(str(root / "*ntigravity*" / "*" / rel / "language_server*"))
     elif os_name == "darwin":
-        for base in (root / "*ntigravity*.app" / "Contents" / "Resources",
-                     root / "*ntigravity*.app" / "Contents" / "resources"):
-            pats.append(str(base / rel_bin / "language_server*"))
-            pats.append(str(base / ext_bin / "language_server*"))
+        # Корень бандла уже указывает на Contents/Resources — вложенный
+        # resources/ внутри него лишний. Раньше здесь клеились
+        # Contents/Resources + resources/bin, то есть искался путь
+        # Contents/Resources/resources/bin/..., которого не бывает: все
+        # четыре паттерна молча не находили ничего, и language_server из
+        # расширения IDE (Contents/Resources/app/extensions/antigravity/bin)
+        # на macOS не патчился никогда.
+        for res in ("Resources", "resources"):
+            base = root / "*ntigravity*.app" / "Contents" / res
+            pats.append(str(base / "bin" / "language_server*"))
+            pats.append(str(base / "app" / "extensions" / "antigravity" / "bin" / "language_server*"))
     else:
         for rel in (rel_bin, ext_bin):
             pats.append(str(root / "*ntigravity*" / rel / "language_server*"))
@@ -1292,8 +1299,12 @@ def find_cli_bins() -> list[Path]:
             cands += [Path(p) for p in _g.glob(str(root / "agy*" / "agy.exe"))]
     else:
         home = Path.home()
+        # Apple Silicon: Homebrew живёт в /opt/homebrew, а не /usr/local.
+        # Без него CLI (agy), поставленный через brew, не находился и
+        # оставался незапатченным.
         for d in (home / ".local" / "bin", home / "bin",
-                  Path("/usr/local/bin"), Path("/usr/bin"), Path("/opt/antigravity/bin")):
+                  Path("/usr/local/bin"), Path("/opt/homebrew/bin"),
+                  Path("/usr/bin"), Path("/opt/antigravity/bin")):
             if (d / "agy").is_file():
                 cands.append(d / "agy")
         loc = Path.cwd() / "agy"
@@ -1664,22 +1675,101 @@ def _mac_sudo_hint(path: Path) -> str:
             f"sudo chflags -R nouchg {str(_mac_app_bundle(path) or path)}")
 
 
-def _mac_write(path: Path, data: bytes):
-    """Запись с одной попыткой через chflags на macOS. None ок, иначе текст ошибки."""
+def _write_atomic_posix(path: Path, data: bytes) -> str | None:
+    """Запись через временный файл рядом и rename поверх. None — ок.
+
+    Прямая перезапись по месту на POSIX ломает две вещи, и обе бьют по
+    macOS-установке:
+
+    - Запущенный Mach-O продолжает работать со своими страницами, которые
+      перезапись затрагивает, — процесс падает с SIGBUS. Windows от этого
+      защищён блокировкой файла (проверяется отдельно), POSIX — нет.
+    - Ядро держит кэш подписи для inode; после перезаписи на месте exec
+      такого файла умирает с «Code Signature Invalid», пока файл не
+      переподписан. Rename даёт свежий vnode, и подпись ставится на новый.
+
+    Права копируются с оригинала: свежий temp создаётся 0644, и без этого
+    language_server потерял бы бит исполнения и не запустился бы.
+    """
+    import errno as _errno
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.agtmp")
+
+    def _write_inplace() -> None:
+        # Запасной путь: создать temp в каталоге может быть нельзя, даже если
+        # сам файл пишется (нет прав на каталог). Тогда пишем по месту.
+        with open(path, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+
     try:
-        path.write_bytes(data)
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+    except OSError as e:
+        # Temp создать не удалось (нет прав на каталог, ROFS и т.п.). Если
+        # причина в правах на каталог — сам файл может быть записываем.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        if getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
+            try:
+                _write_inplace()
+                return None
+            except OSError as e2:
+                return f"write-error: {e2}"
+        # Места не хватило (ENOSPC) или файловая система только для чтения:
+        # по месту писать нельзя — обрезка оставила бы битый бинарь.
+        return f"write-error: {e}"
+
+    try:
+        try:
+            os.chmod(tmp, path.stat().st_mode & 0o7777)
+        except OSError:
+            pass
+        os.replace(tmp, path)
         return None
     except OSError as e:
-        import errno as _errno
-        if sys.platform == "darwin" and getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        if getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
+            # Заблокированный (uchg) файл или запрет на изменение бандла.
+            # Флаг может стоять и на каталоге — rename требует права
+            # записи именно в него, а не в сам файл.
+            if sys.platform == "darwin":
+                _mac_run(["chflags", "-R", "nouchg", str(path.parent)])
             if _mac_ensure_writable(path):
                 try:
-                    path.write_bytes(data)
+                    with open(tmp, "wb") as f:
+                        f.write(data)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.chmod(tmp, path.stat().st_mode & 0o7777)
+                    os.replace(tmp, path)
                     return None
                 except OSError as e2:
                     print(f"    [macos] {_mac_sudo_hint(path)}")
                     return f"write-error: {e2}"
             print(f"    [macos] {_mac_sudo_hint(path)}")
+        return f"write-error: {e}"
+
+
+def _mac_write(path: Path, data: bytes):
+    """Запись бинаря. None — ок, иначе текст ошибки.
+
+    На POSIX — атомарно (temp + rename), см. _write_atomic_posix. На
+    Windows запись по месту: переименование поверх запущенного exe
+    запрещено, а занятость файла проверяется отдельно (_locked_win)."""
+    if os.name != "nt":
+        return _write_atomic_posix(path, data)
+    try:
+        path.write_bytes(data)
+        return None
+    except OSError as e:
         return f"write-error: {e}"
 
 
@@ -2152,6 +2242,15 @@ def _detect_kind(p: Path) -> str:
     return "manager" if p.stat().st_size > 10_000_000 else "cli"
 
 
+def _arch_of(path: Path) -> str | None:
+    """Архитектура бинаря ('x64'/'arm64') или None, если не определилась."""
+    try:
+        _ranges, arch = exec_info(path)
+    except (OSError, ValueError):
+        return None
+    return arch
+
+
 def cmd_status(explicit: str | None = None):
     if explicit:
         p = Path(explicit)
@@ -2198,6 +2297,14 @@ def cmd_status(explicit: str | None = None):
             for k, v in sorted(res.items()):
                 off = v[1] if len(v) > 1 else None
                 print(f"    gate {k}: {v[0]}" + (f" @ {hex(off)}" if off is not None else ""))
+        if name in ("manager", "cli"):
+            arch = _arch_of(p)
+            print(f"  arch:   {arch or '?'}")
+            if arch == "arm64":
+                # Байтовые гейты написаны под x86-64 и на arm64 не совпадут
+                # никогда — работает только rename-гейт (архитектуронезависимый).
+                print("    (байтовые гейты x64 на arm64 не применимы; "
+                      "работает rename-гейт)")
         print(f"  размер: {human_size(size)}  бэкап: {'есть' if bp.exists() else 'нет'}")
     print()
     print("Подсказка: клиентский патч недостаточен без DNS с подменой гео.")
@@ -2319,14 +2426,52 @@ _GOOGLE_V4_NETS = tuple(ipaddress.ip_network(n) for n in (
 ))
 
 
-def _ls_log_path() -> Path:
+def _ls_log_paths() -> list[Path]:
+    """Все возможные логи language_server/CLI, а не один выдуманный путь.
+
+    Раскладка продуктов разная (замерено на живых логах):
+      - Desktop: <profile>/Antigravity/logs/language_server.log
+      - IDE (форк VS Code): <profile>/Antigravity/logs/<сессия>/ls-main.log —
+        по папке на каждый запуск, берём последнюю
+      - CLI: ~/.gemini/{antigravity-cli,antigravity}/log/cli-<stamp>.log
+    На macOS профиль лежит в ~/Library/Application Support, на Windows в
+    %APPDATA%, на Linux в ~/.config. Раньше был один жёсткий путь
+    .../Antigravity/logs/language_server.log, поэтому на IDE и CLI лог не
+    находился вообще, и doctor рапортовал «лог не найден» именно там, где
+    чинить было нужно."""
     if sys.platform == "darwin":
-        base = Path.home() / "Library" / "Application Support" / "Antigravity"
+        profiles = [Path.home() / "Library" / "Application Support" / "Antigravity"]
     elif os.name == "nt":
-        base = Path(os.environ.get("APPDATA", "")) / "Antigravity"
+        profiles = [Path(os.environ.get("APPDATA", "")) / "Antigravity"]
     else:
-        base = Path.home() / ".config" / "Antigravity"
-    return base / "logs" / "language_server.log"
+        profiles = [Path.home() / ".config" / "Antigravity"]
+    out: list[Path] = []
+    for prof in profiles:
+        logs = prof / "logs"
+        out.append(logs / "language_server.log")
+        # IDE: папка на каждый запуск, берём самую свежую.
+        try:
+            sessions = [d for d in logs.iterdir() if d.is_dir()]
+        except OSError:
+            sessions = []
+        if sessions:
+            try:
+                newest = max(sessions, key=lambda d: d.stat().st_mtime)
+            except OSError:
+                newest = None
+            if newest is not None:
+                out.append(newest / "ls-main.log")
+    # CLI: ~/.gemini/<продукт>/log/cli-<stamp>.log
+    gem = Path.home() / ".gemini"
+    for sub in ("antigravity-cli", "antigravity"):
+        try:
+            cands = sorted((gem / sub / "log").glob("cli-*.log"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            cands = []
+        if cands:
+            out.append(cands[0])
+    return [p for p in out if p.is_file()]
 
 
 def _ip_kind(ip: str) -> str:
@@ -2341,21 +2486,37 @@ def _ip_kind(ip: str) -> str:
     return "custom"
 
 
+# Реальный отказ региона в логе language_server (замерено на живых логах
+# Desktop и IDE, обёртка у них разная, но хвост строки один):
+#   FAILED_PRECONDITION (code 400): User location is not supported for the API use.
+# Прежний код искал только «LOCATION_NOT_ELIGIBLE» и «detected_location":"XX» —
+# в живой строке отказа их нет, поэтому doctor показывал «ошибок региона нет»
+# именно тогда, когда регион и блокировал.
+_LS_REFUSAL_RE = re.compile(r"user location is not supported", re.I)
+_LS_DETECTED_RE = re.compile(r'detected_location\\?":\s*\\?"([A-Z]{2})')
+
+
 def _scan_ls_log(text: str):
     """(verdict, detail, count, last_ts) по тексту language_server.log.
-    verdict 'location-block' = сервер ответил LOCATION_NOT_ELIGIBLE."""
+    verdict 'location-block' = сервер ответил отказом по региону."""
     verdict = detail = last_ts = None
     count = 0
-    m = re.search(r'detected_location\\?":\s*\\?"([A-Z]{2})', text)
+    m = _LS_DETECTED_RE.search(text)
     if m:
         verdict = "location-block"
         detail = m.group(1)
     for line in text.splitlines():
-        if "LOCATION_NOT_ELIGIBLE" in line or "PERMISSION_DENIED" in line and "403" in line:
-            count += 1
-            tm = re.search(r'([EWI])(\d{4}) (\d{2}:\d{2}:\d{2})', line)
-            if tm:
-                last_ts = f"{tm.group(2)} {tm.group(3)}"
+        low = line.lower()
+        refused = bool(_LS_REFUSAL_RE.search(line)) or "LOCATION_NOT_ELIGIBLE" in line
+        denied = "PERMISSION_DENIED" in line and "403" in line
+        if not (refused or denied):
+            continue
+        count += 1
+        if refused:
+            verdict = "location-block"
+        tm = re.search(r'([EWI])(\d{4}) (\d{2}:\d{2}:\d{2})', line)
+        if tm:
+            last_ts = f"{tm.group(2)} {tm.group(3)}"
     return verdict, detail, count, last_ts
 
 
@@ -2392,19 +2553,36 @@ def cmd_doctor() -> int:
             rc = 1
 
     print("\n[2/3] лог language_server")
-    lp = _ls_log_path()
-    text = _read_log_tail(lp)
-    verdict, detail, count, last_ts = _scan_ls_log(text) if text else (None, None, 0, None)
-    if text is None:
-        print(f"  лог не найден: {lp} (запусти Antigravity и повтори)")
+    logs = _ls_log_paths()
+    verdict = detail = last_ts = None
+    count = 0
+    for lp in logs:
+        text = _read_log_tail(lp)
+        if not text:
+            continue
+        v, d, c, ts = _scan_ls_log(text)
+        count += c
+        if v == "location-block":
+            verdict = "location-block"
+            detail = detail or d
+        if ts and (last_ts is None or ts > last_ts):
+            last_ts = ts
+    if not logs:
+        print("  логи не найдены (запусти Antigravity и повтори)")
     elif verdict == "location-block":
-        print(f"  [!] LOCATION_NOT_ELIGIBLE: сервер отказал по региону "
-              f"(detected: {detail}), повторов: {count}, последняя: {last_ts}")
-        print(f"      лог: {lp}")
+        where = f" (detected: {detail})" if detail else ""
+        print(f"  [!] сервер отказал по региону{where}, повторов: {count}, "
+              f"последняя: {last_ts}")
+        for lp in logs:
+            print(f"      лог: {lp}")
     elif count:
         print(f"  ошибки доступа к API: {count} (последняя: {last_ts})")
+        for lp in logs:
+            print(f"      лог: {lp}")
     else:
-        print("  ошибок региона/доступа в хвосте лога нет")
+        print(f"  ошибок региона/доступа в хвостах логов нет ({len(logs)} шт.)")
+        for lp in logs:
+            print(f"      лог: {lp}")
 
     print("\n[3/3] DNS-покрытие geo-провайдера")
     old_timeout = socket.getdefaulttimeout()
@@ -2443,12 +2621,15 @@ def cmd_doctor() -> int:
                   "либо включить VPN на всю систему (или https_proxy для LS).")
         elif api_custom:
             print("  [!] Все домены покрыты geo-DNS, но сервер всё равно видит "
-                  f"регион {detail}: вероятно, Google определяет выходной IP "
+                  f"регион {detail or '?'}: вероятно, Google определяет выходной IP "
                   "прокси как запрещённый регион или смотрит на страну аккаунта.")
             print("      Сообщи провайдеру geo-DNS (вердыкт: detected_location="
-                  f"{detail}); попробуй другой аккаунт или VPN с чистым IP.")
+                  f"{detail or '?'}); попробуй другой аккаунт или VPN с чистым IP.")
+        else:
+            print("  [!] Сервер отказал по региону, хотя DNS покрытие выглядит "
+                  "нормальным: нужен VPN на всю систему или https_proxy для LS.")
         rc = 1
-    elif text is None:
+    elif not logs:
         print("  Лога нет — запусти Antigravity, воспроизведи проблему и повтори doctor.")
     elif rc == 0:
         print("  Проблем не видно: клиент пропатчен, в логе ошибок региона нет, "
