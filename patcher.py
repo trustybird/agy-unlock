@@ -76,7 +76,7 @@ import sys
 import time
 from pathlib import Path
 
-VERSION = "2.2.4-analog"
+VERSION = "2.2.5-analog"
 TOOL_NAME = "agy-unlock-analog"
 SIGPACK_FORMAT = 1
 
