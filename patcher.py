@@ -2887,60 +2887,6 @@ def _pause():
         print()
 
 
-def _menu_custom_path(state):
-    print("--- CUSTOM PATH ---")
-    print("1  Manager path   (folder or language_server binary)")
-    print("2  CLI path       (agy.exe or folder)")
-    print("3  IDE path       (folder or main.js)")
-    print("0  Back")
-    try:
-        ch = input("\n  Select option > ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    if ch not in ("1", "2", "3"):
-        return
-    kind = {"1": "manager", "2": "cli", "3": "ide"}[ch]
-    try:
-        raw = input(f"  {kind} Path > ").strip().strip('"').strip("'")
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
-    if not raw:
-        return
-    p = Path(os.path.abspath(os.path.expanduser(raw)))
-    found = None
-    if p.is_file():
-        found = p
-    elif p.is_dir():
-        want = {"manager": ("language_server.exe", "language_server"),
-                "cli": ("agy.exe", "agy"), "ide": ("main.js",)}[kind]
-        for root, _, files in os.walk(p):
-            for fn in want:
-                if fn in files:
-                    found = Path(root) / fn
-                    break
-            if found or len(root.split(os.sep)) > 8:
-                break
-            if found:
-                break
-    if found and found.is_file():
-        state[kind] = (found, "custom")
-        print(f"  Path updated: {found}")
-    else:
-        print("  [!] target not found at this path")
-
-
-def _menu_about():
-    print(f"--- ABOUT {TOOL_NAME} {VERSION} ---")
-    print("  Removes the Antigravity region block locally:")
-    print("  Manager (language_server binary), CLI (agy binary), IDE (main.js).")
-    print("  Backups are kept as *.agybak, everything is reversible.")
-    print("  Note: a DNS with geo-spoofing is still required,")
-    print("  the client patch alone is not enough.")
-    print("  Repo: https://github.com/trustybird/agy-unlock")
-
-
 def interactive(custom=None):
     state = _menu_state()
     if custom:
@@ -2958,12 +2904,6 @@ def interactive(custom=None):
         print("[5]  Antigravity IDE         from backup")
         print("[6]  Antigravity 2.0         from backup")
         print("[7]  Antigravity CLI         from backup")
-        print("--- TOOLS " + "-" * 50)
-        print("[8]  Daemon install          re-patch automatically after updates")
-        print("[9]  Daemon status           check background task")
-        print("[10] Learn                   re-discover gates in new builds")
-        print("[11] Custom path             override auto-detected target")
-        print("[12] About                   info and links")
         print()
         print("[0]  Exit                    quit the patcher")
         print(_c("Tip: patches are reversible - use RESTORE any time.", "dim"))
@@ -2977,7 +2917,7 @@ def interactive(custom=None):
             break
         if ch == "":
             continue
-        if ch not in {str(i) for i in range(1, 13)}:
+        if ch not in {str(i) for i in range(1, 8)}:
             print("[!] Invalid choice")
             _pause()
             continue
@@ -2988,7 +2928,7 @@ def interactive(custom=None):
                 name = {"1": "ide", "2": "manager", "3": "cli"}[ch]
                 p, _ = state.get(name, (None, None))
                 if p is None:
-                    print(f"[!] {name} not found - use 11 Custom path first")
+                    print(f"[!] {name} not found")
                 elif name == "manager":
                     print(f"[*] {p}\n    -> {do_unlock(p, False)}")
                 elif name == "cli":
@@ -3002,31 +2942,10 @@ def interactive(custom=None):
             name = {"5": "ide", "6": "manager", "7": "cli"}[ch]
             p, _ = state.get(name, (None, None))
             if p is None:
-                print(f"[!] {name} not found - use 11 Custom path first")
+                print(f"[!] {name} not found")
             else:
                 print(f"[*] {p}\n    -> {do_restore(p)}")
             state = _menu_state()
-            _pause()
-            _clear()
-        elif ch == "8":
-            daemon_install()
-            _pause()
-            _clear()
-        elif ch == "9":
-            daemon_status()
-            _pause()
-            _clear()
-        elif ch == "10":
-            cmd_learn("all", None, apply=False, auto=False)
-            state = _menu_state()
-            _pause()
-            _clear()
-        elif ch == "11":
-            _menu_custom_path(state)
-            _pause()
-            _clear()
-        elif ch == "12":
-            _menu_about()
             _pause()
             _clear()
 
