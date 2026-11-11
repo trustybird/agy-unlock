@@ -2395,10 +2395,9 @@ def _ip_kind(ip: str) -> str:
 # Реальный отказ региона в логе language_server (замерено на живых логах
 # Desktop и IDE, обёртка у них разная, но хвост строки один):
 #   FAILED_PRECONDITION (code 400): User location is not supported for the API use.
-# Прежний код искал только «LOCATION_NOT_ELIGIBLE» и «detected_location":"XX» —
-# в живой строке отказа их нет, поэтому doctor показывал «ошибок региона нет»
-# именно тогда, когда регион и блокировал.
-_LS_REFUSAL_RE = re.compile(r"user location is not supported", re.I)
+# Или при авторизации (onboardUser) в 403 PERMISSION_DENIED:
+#   "reason": "UNSUPPORTED_LOCATION" (account is not currently available in your location)
+_LS_REFUSAL_RE = re.compile(r"user location is not supported|unsupported_location", re.I)
 _LS_DETECTED_RE = re.compile(r'detected_location\\?":\s*\\?"([A-Z]{2})')
 
 
@@ -2416,6 +2415,10 @@ def _scan_ls_log(text: str):
         refused = bool(_LS_REFUSAL_RE.search(line)) or "LOCATION_NOT_ELIGIBLE" in line
         denied = "PERMISSION_DENIED" in line and "403" in line
         if not (refused or denied):
+            continue
+        # Если блок 403 дублирует API Error: {Reason:UNSUPPORTED_LOCATION} сразу после JSON,
+        # не завышаем счётчик
+        if "api error:" in low and "unsupported_location" in low:
             continue
         count += 1
         if refused:
