@@ -72,58 +72,34 @@ curl -fsSL https://raw.githubusercontent.com/trustybird/agy-unlock/main/install.
 
 - Нужен Python 3.8+ (в системе его нет — ставь с python.org).
 - Запись в `/Applications` требует прав: закрой Antigravity и при
-  отказе запускай с `sudo` (скрипт сам подскажет).
-- После патча переподписывается весь код в bundle ad-hoc — каждый вложенный
-  элемент отдельно (framework'и, helper'ы, бинари; от самых глубоких),
-  с сохранением entitlements, hardened runtime и флагов — затем сам bundle.
-  `codesign --deep` не используется: он пропускает ещё валидно подписанный
-  родной (Google) код, остаётся смесь Team ID, и library validation убивает
-  приложение при запуске. Подпись проверяется (`codesign --verify`);
-  если проверка не прошла — патч считается неуспешным, а не «готово».
-- Apple Silicon и Intel поддерживаются (сигнатуры под каждую архитектуру).
-- Запись бинаря идёт через временный файл рядом и `rename` поверх, а не
-  перезаписью по месту. На macOS это обязательно: у перезаписанного на месте
-  Mach-O остаётся старый кэш подписи ядра, и процесс умирает на старте с
-  «Code Signature Invalid», пока файл не переподписан; кроме того, работающий
-  бинарь при перезаписи своих страниц падает с SIGBUS. Права (бит
-  исполнения) переносятся с оригинала.
+  отказе запускай с `sudo` (установщик сам попробует через `sudo`).
+- В **macOS 13+ (Ventura / Sonoma / Sequoia)** действует защита App Management:
+  если запись отклонена с `Operation not permitted`, откройте:
+  *Системные настройки → Конфиденциальность и безопасность → Управление приложениями*
+  и разрешите **Терминал**.
+- **Корректная подпись кода:**
+  Переподписывается **только сам пропатченный бинарник** (`language_server` / `agy`)
+  ad-hoc подписью (`codesign --force --sign - --preserve-metadata=identifier`)
+  без Hardened Runtime и restricted entitlements (которые на Apple Silicon
+  приводят к SIGKILL со стороны AMFI), и с файла и бандла снимается атрибут карантина
+  (`xattr -dr com.apple.quarantine`).
+  Сам бандл `Antigravity.app` и вложенный `Electron Framework` намеренно **НЕ переподписываются**,
+  так как `language_server` запускается как независимый дочерний процесс, а нарушение
+  оригинальной подписи Google ломало бы Library Validation, Gatekeeper и macOS Keychain.
+- Apple Silicon (M1/M2/M3/M4) и Intel поддерживаются.
+- Запись бинаря идёт через временный файл рядом: бинарник подписывается
+  **до** перемещения на место, что гарантирует получение свежего vnode в ядре.
 
-### Если словил SIGKILL или «different Team IDs»
+### Если приложение ранее было повреждено старой версией патчера
 
-Два симптома битой подписи:
+Если на macOS ранее запускался старый скрипт, который переподписал весь бандл и
+приложение крашится при запуске (`EXC_CRASH (SIGABRT)` / `different Team IDs`),
+проще всего переустановить Antigravity:
+1. Удалите `Antigravity.app` из `/Applications`.
+2. Скачайте свежий DMG с официального сайта и перетащите его заново в `/Applications`.
+3. Запустите обновлённый `install.sh`.
 
-- `Language server exited unexpectedly (signal=SIGKILL)` — пропатченный
-  бинарь остался с недействительной подписью;
-- краш приложения сразу при запуске (`EXC_CRASH (SIGABRT)`, в отчёте
-  DYLD: `... (non-platform) have different Team IDs`) — главный exe уже
-  ad-hoc, а часть вложенного кода (Electron Framework и т.п.) осталась
-  с родной подписью; library validation не даёт грузить чужой Team ID.
-
-Починка без повторного патча (закрой Antigravity), основной способ:
-
-```sh
-agy-unlock-analog sign
-```
-
-Если патчера рядом нет, вручную (после `sudo`):
-
-```sh
-sudo xattr -dr com.apple.quarantine /Applications/Antigravity.app
-cd /Applications/Antigravity.app
-sudo find Contents -depth \( -name '*.framework' -o -name '*.app' \
-  -o -name '*.xpc' -o -name '*.appex' -o -name '*.bundle' \) \
-  -exec codesign --force --sign - {} +
-sudo find Contents -type f \( -name '*.dylib' -o -name '*.node' \) \
-  -exec codesign --force --sign - {} +
-sudo codesign --force --sign - Contents/Resources/bin/language_server
-sudo codesign --force --sign - /Applications/Antigravity.app
-sudo codesign --verify --deep --strict /Applications/Antigravity.app
-```
-
-Важно: `codesign --force --deep --sign -` здесь не поможет — он не
-трогает ещё валидно подписанный вложенный код, и смесь Team ID остаётся.
-
-### Диагностика: «пропатчено, но всё равно ineligible»
+### Диагностика: «пропатчено, но всё равно ineligible / 400»
 
 ```sh
 agy-unlock-analog doctor
@@ -134,17 +110,11 @@ agy-unlock-analog doctor
 1. **клиент** — статус гейтов manager (auth/elig/rename);
 2. **лог language_server** — ищет отказ региона от сервера Google:
    `FAILED_PRECONDITION (code 400): User location is not supported for the
-   API use` (встречается и как `LOCATION_NOT_ELIGIBLE`, и как «Detected
-   location: XX»). Это отказ на стороне Google, клиентский патч тут
-   бессилен. Логи ищутся во всех продуктах сразу — Desktop
-   (`logs/language_server.log`), IDE (`logs/<сессия>/ls-main.log`) и CLI
-   (`~/.gemini/*/log/cli-*.log`), потому что у каждого свой путь;
-3. **DNS-покрытие** — какие домены Google резолвятся через geo-DNS,
-   а какие уходят напрямую. Типичный случай: API-домены покрыты, но
-   `oauth2.googleapis.com` и `accounts.google.com` — нет, тогда Google
-   видит реальный регион в токенах и входе. Лечение: попросить
-   провайдера geo-DNS покрыть эти домены или включить VPN на всю
-   систему (language_server понимает и `https_proxy`).
+   API use`. Это отказ на стороне Google по IP, клиентский патч тут
+   бессилен.
+3. **DNS / Сеть** — Google блокирует запросы к `cloudcode-pa.googleapis.com`
+   по российскому IP. Для работы на macOS требуется активный VPN на всю систему,
+   geo-DNS или прокси для language_server (`https_proxy`).
 
 ### Если на macOS «не срабатывает»
 

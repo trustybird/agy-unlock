@@ -1670,66 +1670,84 @@ def _mac_ensure_writable(path: Path) -> bool:
 
 
 def _mac_sudo_hint(path: Path) -> str:
-    return (f"macOS blocked writing {path}. Close the app, then either "
-            f"re-run with sudo or clear flags first: "
-            f"sudo chflags -R nouchg {str(_mac_app_bundle(path) or path)}")
+    bundle = _mac_app_bundle(path) or path
+    return (
+        f"macOS blocked writing {path}.\n"
+        f"    1. Close Antigravity completely.\n"
+        f"    2. Try running with sudo: sudo agy-unlock-analog unlock all\n"
+        f"    3. On macOS 13+ (Ventura/Sonoma/Sequoia): System Settings -> Privacy & Security -> "
+        f"App Management -> enable Terminal, then retry.\n"
+        f"    4. If flags are locked: sudo chflags -R nouchg {bundle}"
+    )
+
+
+def _mac_is_macho_data(data: bytes) -> bool:
+    return len(data) >= 4 and data[:4] in (
+        b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+        b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+        b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"
+    )
+
+
+def _mac_resign_binary(path: Path) -> str | None:
+    """Signs Mach-O path ad hoc, keeping identifier if present.
+    Does NOT carry over hardened runtime or restricted entitlements,
+    which cause AMFI on Apple Silicon to SIGKILL ad-hoc binaries."""
+    rc, out = _mac_run(["codesign", "--force", "--sign", "-", "--preserve-metadata=identifier", str(path)])
+    if rc == 0:
+        return None
+    rc2, out2 = _mac_run(["codesign", "--force", "--sign", "-", str(path)])
+    if rc2 == 0:
+        return None
+    return f"codesign failed: {out2.strip() or out.strip()}"
+
+
+def _mac_strip_quarantine(path: Path) -> None:
+    """Takes the quarantine flag off path (best-effort)."""
+    _mac_run(["xattr", "-dr", "com.apple.quarantine", str(path)])
 
 
 def _write_atomic_posix(path: Path, data: bytes) -> str | None:
-    """Запись через временный файл рядом и rename поверх. None — ок.
-
-    Прямая перезапись по месту на POSIX ломает две вещи, и обе бьют по
-    macOS-установке:
-
-    - Запущенный Mach-O продолжает работать со своими страницами, которые
-      перезапись затрагивает, — процесс падает с SIGBUS. Windows от этого
-      защищён блокировкой файла (проверяется отдельно), POSIX — нет.
-    - Ядро держит кэш подписи для inode; после перезаписи на месте exec
-      такого файла умирает с «Code Signature Invalid», пока файл не
-      переподписан. Rename даёт свежий vnode, и подпись ставится на новый.
-
-    Права копируются с оригинала: свежий temp создаётся 0644, и без этого
-    language_server потерял бы бит исполнения и не запустился бы.
-    """
+    """Atomic write via sibling temp file and rename.
+    On macOS: Mach-O binaries are re-signed ad hoc and quarantine is stripped
+    BEFORE rename, so target path always points to a valid executable and
+    gets a fresh vnode."""
     import errno as _errno
     tmp = path.with_name(f"{path.name}.{os.getpid()}.agtmp")
 
-    def _write_inplace() -> None:
-        # Запасной путь: создать temp в каталоге может быть нельзя, даже если
-        # сам файл пишется (нет прав на каталог). Тогда пишем по месту.
-        with open(path, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
+    def _prepare_temp() -> str | None:
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(tmp, path.stat().st_mode & 0o7777)
+            except OSError:
+                pass
+            if sys.platform == "darwin" and _mac_is_macho_data(data):
+                err = _mac_resign_binary(tmp)
+                if err:
+                    return err
+                _mac_strip_quarantine(tmp)
+            return None
+        except OSError as e:
+            return f"write-error: {e}"
 
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-    except OSError as e:
-        # Temp создать не удалось (нет прав на каталог, ROFS и т.п.). Если
-        # причина в правах на каталог — сам файл может быть записываем.
+    err = _prepare_temp()
+    if err:
         try:
             tmp.unlink()
         except OSError:
             pass
-        if getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
-            try:
-                _write_inplace()
-                return None
-            except OSError as e2:
-                return f"write-error: {e2}"
-        # Места не хватило (ENOSPC) или файловая система только для чтения:
-        # по месту писать нельзя — обрезка оставила бы битый бинарь.
-        return f"write-error: {e}"
+        return err
 
     try:
-        try:
-            os.chmod(tmp, path.stat().st_mode & 0o7777)
-        except OSError:
-            pass
         os.replace(tmp, path)
+        if sys.platform == "darwin":
+            bundle = _mac_app_bundle(path)
+            if bundle:
+                _mac_strip_quarantine(bundle)
         return None
     except OSError as e:
         try:
@@ -1737,24 +1755,26 @@ def _write_atomic_posix(path: Path, data: bytes) -> str | None:
         except OSError:
             pass
         if getattr(e, "errno", None) in (_errno.EPERM, _errno.EACCES):
-            # Заблокированный (uchg) файл или запрет на изменение бандла.
-            # Флаг может стоять и на каталоге — rename требует права
-            # записи именно в него, а не в сам файл.
             if sys.platform == "darwin":
                 _mac_run(["chflags", "-R", "nouchg", str(path.parent)])
-            if _mac_ensure_writable(path):
-                try:
-                    with open(tmp, "wb") as f:
-                        f.write(data)
-                        f.flush()
-                        os.fsync(f.fileno())
-                    os.chmod(tmp, path.stat().st_mode & 0o7777)
-                    os.replace(tmp, path)
-                    return None
-                except OSError as e2:
-                    print(f"    [macos] {_mac_sudo_hint(path)}")
-                    return f"write-error: {e2}"
-            print(f"    [macos] {_mac_sudo_hint(path)}")
+                if _mac_ensure_writable(path):
+                    err2 = _prepare_temp()
+                    if not err2:
+                        try:
+                            os.replace(tmp, path)
+                            bundle = _mac_app_bundle(path)
+                            if bundle:
+                                _mac_strip_quarantine(bundle)
+                            return None
+                        except OSError as e3:
+                            print(f"    [macos] {_mac_sudo_hint(path)}")
+                            return f"write-error: {e3}"
+                        finally:
+                            try:
+                                tmp.unlink()
+                            except OSError:
+                                pass
+                print(f"    [macos] {_mac_sudo_hint(path)}")
         return f"write-error: {e}"
 
 
@@ -1773,166 +1793,43 @@ def _mac_write(path: Path, data: bytes):
         return f"write-error: {e}"
 
 
-def _mac_run_out(cmd: list[str]) -> tuple[int, bytes, str]:
-    """Как _mac_run, но stdout отдельно (нужно для entitlements)."""
-    import subprocess
-    try:
-        r = subprocess.run(cmd, capture_output=True, timeout=120)
-        return r.returncode, r.stdout or b"", (r.stderr or b"").decode(errors="replace")
-    except (OSError, ValueError) as e:
-        return 127, b"", str(e)
-
-
-def _mac_entitlements(path: Path) -> bytes | None:
-    """Текущие entitlements подписи (XML) или None."""
-    rc, out, err = _mac_run_out(
-        ["codesign", "-d", "--entitlements", ":-", str(path)])
-    for blob in (out, err.encode(errors="replace")):
-        start = blob.find(b"<?xml")
-        if rc == 0 and start != -1:
-            end = blob.rfind(b"</plist>")
-            if end != -1:
-                return blob[start:end + len(b"</plist>")]
-    return None
-
-
-def _mac_signature_ok(path: Path) -> bool:
-    rc, _ = _mac_run(["codesign", "--verify", "--deep", "--strict", str(path)])
-    return rc == 0
-
-
 def _mac_is_macho(path: Path) -> bool:
     try:
         with path.open("rb") as f:
-            return f.read(4) in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
-                                 b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca")
+            magic = f.read(4)
+            return magic in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf",
+                             b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                             b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca")
     except OSError:
         return False
 
 
-def _mac_sign_one(path: Path, deep: bool = True,
-                  ent: bytes | None = None) -> tuple[int, str]:
-    """Ad-hoc подпись с сохранением entitlements, флагов и hardened runtime."""
-    import tempfile
-    if ent is None:
-        ent = _mac_entitlements(path)
-    tmp_name = None
-    cmd = ["codesign", "--force", "--sign", "-"]
-    preserve = "flags,runtime" if ent else "entitlements,flags,runtime"
-    cmd.append("--preserve-metadata=" + preserve)
-    if deep and path.is_dir():
-        cmd.insert(2, "--deep")
-    if ent:
-        try:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".plist") as tmp:
-                tmp.write(ent)
-                tmp_name = tmp.name
-            cmd += ["--entitlements", tmp_name]
-        except OSError:
-            pass
-    rc, out = _mac_run(cmd + [str(path)])
-    if tmp_name:
-        try:
-            Path(tmp_name).unlink()
-        except OSError:
-            pass
-    return rc, out
-
-
-def _mac_entitlements_for(path: Path) -> bytes | None:
-    """Entitlements патченного файла, иначе — из его стокового бэкапа.
-    Прошлый патчер мог переподписать без entitlements, и в живом файле их
-    уже нет; в .agybak подпись ещё оригинальная."""
-    ent = _mac_entitlements(path)
-    if ent:
-        return ent
-    bp = backup_path_for(path)
-    try:
-        if bp.exists():
-            return _mac_entitlements(bp)
-    except OSError:
-        pass
-    return None
-
-
-MAC_BUNDLE_PAT = ("*.framework", "*.app", "*.xpc", "*.appex", "*.bundle", "*.kext")
-
-
-def _mac_nested_code(root: Path):
-    """Вложенный код для переподписи: бандлы (.framework/.app/...) и отдельные
-    Mach-O файлы (dylib, node, пропатченные бинари), самые глубокие — первыми.
-    .agybak исключён: это бэкап оригинала, его содержимое менять нельзя.
-    --deep не годится: он пропускает ещё валидно подписанный (Google) вложенный
-    код, и остаётся смесь Team ID — главный exe adhoc + фреймворк от Google.
-    Library validation убивает такой процесс при запуске (SIGABRT, DYLD
-    'different Team IDs'), поэтому подписываем всё явно, от самых глубоких,
-    и только затем сам бандл."""
-    out, seen = [], set()
-
-    def add(p: Path):
-        if p.name.endswith(".agybak"):
-            return
-        try:
-            rp = p.resolve()
-        except OSError:
-            return
-        if rp not in seen:
-            seen.add(rp)
-            out.append(p)
-
-    for pat in MAC_BUNDLE_PAT:
-        for p in root.rglob(pat):
-            add(p)
-    for p in root.rglob("*"):
-        if p.is_file() and _mac_is_macho(p):
-            add(p)
-    out.sort(key=lambda p: len(p.parts), reverse=True)
-    return out
+def _mac_signature_ok(path: Path) -> bool:
+    rc, _ = _mac_run(["codesign", "--verify", "--strict", str(path)])
+    return rc == 0
 
 
 def _mac_finalize(path: Path):
-    """Переподпись после патча. None — ок, иначе текст ошибки.
+    """Переподпись после патча на macOS. None — ок, иначе текст ошибки.
 
-    Модифицированный бинарь теряет подпись, и macOS убивает его SIGKILL.
-    Бандл тоже нельзя оставлять наполовину родным: --deep пропускает ещё
-    валидные Google-подписи вложенного кода, главный exe при этом становится
-    adhoc, и library validation убивает приложение (SIGABRT, 'different Team
-    IDs'). Подписываем каждый вложенный элемент явно (preserve сохраняет
-    entitlements/flags/runtime каждого), затем сам бандл, затем патченный
-    бинарь его entitlements (из .agybak, если живые потеряны) и заново
-    печать бандла. Сломанные подписи чинятся командой `sign`."""
+    Переподписываем ТОЛЬКО сам изменённый бинарь (language_server / agy) ad-hoc
+    с сохранением identifier (без hardened runtime и без entitlements, которые
+    на Apple Silicon приводят к AMFI SIGKILL).
+
+    Бандл Antigravity.app и вложенные Electron Framework НЕ трогаем:
+    language_server запускается как отдельный дочерний процесс (spawn),
+    а переподпись бандла ad-hoc ломает валидную подпись Google, Library
+    Validation в Electron, Keychain и триггерит блокировку Gatekeeper."""
     if sys.platform != "darwin":
         return None
-    target = _mac_app_bundle(path) or path
-    _mac_run(["xattr", "-dr", "com.apple.quarantine", str(target)])
-    if target.is_dir():
-        fails = 0
-        for p in _mac_nested_code(target):
-            if p.is_file():
-                _mac_ensure_writable(p)
-            rc2, _ = _mac_sign_one(p, deep=False)
-            if rc2 != 0:
-                fails += 1
-        if fails:
-            print(f"    [macos] {fails} вложенных элементов не переподписались "
-                  "(если это важно, verify ниже честно упадёт)")
-        rc, out = _mac_sign_one(target, deep=False)
-    else:
-        rc, out = _mac_sign_one(target, deep=False)
-    if rc != 0:
-        return f"sign-error: {out[-500:]}"
-    if target != path and _mac_is_macho(path):
-        # патченный бинарь: его entitlements (из .agybak, если живые потеряны)
-        # и свежая печать бандла поверх
-        erc, eout = _mac_sign_one(path, deep=False, ent=_mac_entitlements_for(path))
-        if erc != 0:
-            return f"sign-error: {eout[-500:]}"
-        rc, out = _mac_sign_one(target, deep=False)
-        if rc != 0:
-            return f"sign-error: {out[-500:]}"
-    if not _mac_signature_ok(target):
-        return "sign-error: verify failed"
-    print(f"    [macos] re-signed {target.name}")
+    if _mac_is_macho(path):
+        err = _mac_resign_binary(path)
+        if err:
+            return f"sign-error: {err}"
+        _mac_strip_quarantine(path)
+    bundle = _mac_app_bundle(path)
+    if bundle:
+        _mac_strip_quarantine(bundle)
     return None
 
 
@@ -2188,6 +2085,11 @@ def do_restore(target_path: Path) -> str:
         return "no-backup"
     try:
         shutil.copy2(bp, target_path)
+        if sys.platform == "darwin":
+            _mac_strip_quarantine(target_path)
+            bundle = _mac_app_bundle(target_path)
+            if bundle:
+                _mac_strip_quarantine(bundle)
     except OSError as e:
         return f"restore-error: {e}"
     return "restored"
@@ -2374,7 +2276,7 @@ def cmd_restore(sel: str, explicit: str | None):
 
 
 def cmd_sign(sel: str = "all", explicit: str | None = None):
-    """macOS: переподписать уже пропатченные цели (лечит SIGKILL при старте)."""
+    """macOS: переподписать пропатченные бинарники (лечит SIGKILL при старте)."""
     if sys.platform != "darwin":
         print("[!] sign: только macOS")
         return 0
@@ -2389,14 +2291,18 @@ def cmd_sign(sel: str = "all", explicit: str | None = None):
     rc = 0
     seen = set()
     for name, path in tmap.items():
-        if not path.exists():
+        if not path or not path.exists():
             continue
-        target = _mac_app_bundle(path) or path
-        key = target.resolve()
+        try:
+            key = path.resolve()
+        except OSError:
+            key = path
         if key in seen:
             continue
         seen.add(key)
-        print(f"[*] {name}: {target}")
+        if not _mac_is_macho(path):
+            continue
+        print(f"[*] {name}: {path}")
         err = _mac_finalize(path)
         print(f"    -> {'signed' if err is None else err}")
         if err:
@@ -2750,7 +2656,13 @@ def daemon_install():
 <key>StandardErrorPath</key><string>{d}/daemon.log</string>
 </dict></plist>
 """, encoding="utf-8")
-        print(f"[+] launchd агент: {plist}\n    запуск: launchctl load {plist}")
+        try:
+            import subprocess
+            subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
+            subprocess.run(["launchctl", "load", str(plist)], capture_output=True)
+        except Exception:
+            pass
+        print(f"[+] launchd агент установлен и запущен: {plist}")
         return 0
     unit = Path.home() / ".config" / "systemd" / "user" / f"{TOOL_NAME}.service"
     unit.parent.mkdir(parents=True, exist_ok=True)
