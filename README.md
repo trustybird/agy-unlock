@@ -108,10 +108,17 @@ agy-unlock-analog doctor
 Проверяет три слоя и подсказывает, где именно сломалось:
 
 1. **клиент** — статус гейтов manager (auth/elig/rename);
-2. **лог language_server** — ищет отказ региона от сервера Google:
-   `FAILED_PRECONDITION (code 400): User location is not supported for the
-   API use`. Это отказ на стороне Google по IP, клиентский патч тут
-   бессилен.
+2. **лог language_server** — ищет отказ региона от сервера Google. Два
+   вида, и оба означают, что клиентский патч тут бессилен:
+   - `FAILED_PRECONDITION (code 400): User location is not supported for
+     the API use` (встречается и как `LOCATION_NOT_ELIGIBLE`, и как
+     «Detected location: XX»);
+   - `403 UNSUPPORTED_LOCATION` при входе — «Your current account is not
+     eligible … because it is not currently available in your location».
+     В новых сборках это не ineligible-экран, а отказ
+     `get_auth_status` / `onboardUser`: в логе нет ни слова `ineligible`,
+     ни кода страны — только `reason` в JSON и дубль в строке `API Error`.
+     Doctor считает такую пару один раз и берёт дату со строки с штампом.
 3. **DNS / Сеть** — Google блокирует запросы к `cloudcode-pa.googleapis.com`
    по российскому IP. Для работы на macOS требуется активный VPN на всю систему,
    geo-DNS или прокси для language_server (`https_proxy`).

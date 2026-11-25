@@ -2416,16 +2416,25 @@ def _scan_ls_log(text: str):
         denied = "PERMISSION_DENIED" in line and "403" in line
         if not (refused or denied):
             continue
+        # Штамп гlog есть только на строке «API Error: … UNSUPPORTED_LOCATION»,
+        # а в JSON-блоке («reason»/«message») его нет. Берём дату отовсюду,
+        # в том числе с дубля, иначе doctor печатает «последняя: None».
+        tm = re.search(r'([EWI])(\d{4}) (\d{2}:\d{2}:\d{2})', line)
+        if tm:
+            last_ts = f"{tm.group(2)} {tm.group(3)}"
         # Если блок 403 дублирует API Error: {Reason:UNSUPPORTED_LOCATION} сразу после JSON,
         # не завышаем счётчик
         if "api error:" in low and "unsupported_location" in low:
+            if verdict != "location-block":
+                verdict = "location-block"
+            if detail is None:
+                detail = "403 UNSUPPORTED_LOCATION"
             continue
         count += 1
         if refused:
             verdict = "location-block"
-        tm = re.search(r'([EWI])(\d{4}) (\d{2}:\d{2}:\d{2})', line)
-        if tm:
-            last_ts = f"{tm.group(2)} {tm.group(3)}"
+            if detail is None and "unsupported_location" in low:
+                detail = "403 UNSUPPORTED_LOCATION"
     return verdict, detail, count, last_ts
 
 
